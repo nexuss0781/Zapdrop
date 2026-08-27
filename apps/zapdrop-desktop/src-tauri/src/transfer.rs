@@ -114,6 +114,8 @@ struct V2DirectReady {
     version: u32,
     job_id: String,
     offsets: HashMap<String, u64>,
+    #[serde(default)]
+    missing_ranges: HashMap<String, Vec<crate::snapshot::ByteRange>>,
 }
 
 #[cfg(feature = "swarm-v2")]
@@ -1319,6 +1321,7 @@ fn send_v2_direct(
         aead: "x25519-hkdf-sha256-chacha20poly1305".to_string(),
     };
     let manifest = build_v2_manifest(sources, &profile)?;
+    verify_v2_sources_unchanged(sources, &manifest)?;
     let total_bytes = manifest.iter().try_fold(0u64, |total, item| {
         total
             .checked_add(item.size)
@@ -1366,65 +1369,92 @@ fn send_v2_direct(
         return Err(invalid("invalid v2 direct ready frame"));
     }
     let piece_size = job.chunk_profile.piece_size as usize;
-    let mut sent_bytes = ready.offsets.values().copied().sum::<u64>();
+    let mut sent_bytes = 0u64;
     for item in &manifest {
+        sent_bytes = sent_bytes.saturating_add(
+            if let Some(ranges) = ready.missing_ranges.get(&item.item_id) {
+                item.size
+                    .saturating_sub(ranges.iter().map(|range| range.length).sum())
+            } else {
+                *ready.offsets.get(&item.item_id).unwrap_or(&0)
+            },
+        );
         let source = source_for_item(sources, item)?;
         let mut file = File::open(source)?;
         let offset = *ready.offsets.get(&item.item_id).unwrap_or(&0);
         if offset > item.size || offset % job.chunk_profile.piece_size != 0 {
             return Err(invalid("receiver supplied an invalid v2 resume offset"));
         }
-        file.seek(SeekFrom::Start(offset))?;
-        let mut offset = offset;
-        let mut index = offset / job.chunk_profile.piece_size;
+        let ranges = ready
+            .missing_ranges
+            .get(&item.item_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                if offset < item.size {
+                    vec![crate::snapshot::ByteRange {
+                        offset,
+                        length: item.size - offset,
+                    }]
+                } else {
+                    Vec::new()
+                }
+            });
+        validate_v2_missing_ranges(&ranges, item.size, job.chunk_profile.piece_size)?;
         let mut buffer = vec![0u8; piece_size];
-        while offset < item.size {
-            if manager.is_some_and(|manager| manager.is_cancelled(transfer_id)) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "v2 transfer cancelled",
-                ));
+        for range in ranges {
+            let mut current = range.offset;
+            let end = range.offset + range.length;
+            file.seek(SeekFrom::Start(current))?;
+            let mut index = current / job.chunk_profile.piece_size;
+            while current < end {
+                if manager.is_some_and(|manager| manager.is_cancelled(transfer_id)) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "v2 transfer cancelled",
+                    ));
+                }
+                let target = (end - current).min(piece_size as u64) as usize;
+                let read = file.read(&mut buffer[..target])?;
+                if read == 0 {
+                    return Err(invalid("source ended before v2 manifest range"));
+                }
+                let piece_id = format!("piece-{}-{index}", item.item_id);
+                let (header, ciphertext) = seal_piece(
+                    &job_key,
+                    &job.job_id,
+                    &job.snapshot_root,
+                    &piece_id,
+                    &item.item_id,
+                    index,
+                    current,
+                    &buffer[..read],
+                )
+                .map_err(invalid)?;
+                let piece = V2DirectPiece {
+                    kind: V2_DIRECT_PIECE_KIND.to_string(),
+                    version: SWARM_PROTOCOL_VERSION,
+                    header,
+                    ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
+                };
+                write_v2_frame(&stream, &seal_v2_json(&mut channel, &piece, V2_PIECE_AAD)?)?;
+                current += read as u64;
+                index += 1;
+                sent_bytes += read as u64;
+                emit_progress(
+                    app,
+                    transfer_id,
+                    &peer.id,
+                    &peer.name,
+                    "send",
+                    "transferring",
+                    Some(item.relative_path.clone()),
+                    sent_bytes,
+                    total_bytes,
+                    0,
+                    manifest.len(),
+                    None,
+                );
             }
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                return Err(invalid("source ended before v2 manifest size"));
-            }
-            let piece_id = format!("piece-{}-{index}", item.item_id);
-            let (header, ciphertext) = seal_piece(
-                &job_key,
-                &job.job_id,
-                &job.snapshot_root,
-                &piece_id,
-                &item.item_id,
-                index,
-                offset,
-                &buffer[..read],
-            )
-            .map_err(invalid)?;
-            let piece = V2DirectPiece {
-                kind: V2_DIRECT_PIECE_KIND.to_string(),
-                version: SWARM_PROTOCOL_VERSION,
-                header,
-                ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
-            };
-            write_v2_frame(&stream, &seal_v2_json(&mut channel, &piece, V2_PIECE_AAD)?)?;
-            offset += read as u64;
-            index += 1;
-            sent_bytes += read as u64;
-            emit_progress(
-                app,
-                transfer_id,
-                &peer.id,
-                &peer.name,
-                "send",
-                "transferring",
-                Some(item.relative_path.clone()),
-                sent_bytes,
-                total_bytes,
-                0,
-                manifest.len(),
-                None,
-            );
         }
     }
     let completion_frame: EncryptedFrame = read_v2_frame(&mut reader)?;
@@ -1683,6 +1713,7 @@ fn receive_v2_direct_inner(
     validate_v2_direct_offer(&offer, context, peer_id, peer_key)?;
     let policy = normalize_conflict_policy(&context.default_conflict_policy)?;
     let destination = safe_root(&context.receive_directory)?;
+    crate::snapshot::disk_space_preflight(&destination, offer.total_bytes, None)?;
     if !decision_already_sent {
         let decision = V2DirectDecision {
             kind: V2_DIRECT_DECISION_KIND.to_string(),
@@ -1736,110 +1767,134 @@ fn receive_v2_direct_inner(
     for item in &offer.items {
         let partial = v2_partial_path(&destination, &offer.job.job_id, &item.item_id)?;
         reject_symlink(&partial)?;
-        let mut offset = fs::metadata(&partial)
+        let partial_offset = fs::metadata(&partial)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
+        let journal_offset = journal.contiguous_offset(&item.item_id, item.size);
+        let mut offset = partial_offset;
+        if partial_offset != 0 && journal_offset == 0 {
+            let _ = fs::remove_file(&partial);
+            offset = 0;
+        }
+        if journal_offset != 0 && journal_offset != partial_offset && partial_offset != item.size {
+            let _ = fs::remove_file(&partial);
+            offset = 0;
+        }
         if offset > item.size || offset % offer.job.chunk_profile.piece_size != 0 {
             let _ = fs::remove_file(&partial);
             offset = 0;
         }
         offsets.insert(item.item_id.clone(), offset);
-        total_done = total_done.saturating_add(offset);
+        total_done = total_done.saturating_add(journal.verified_bytes(&item.item_id, item.size));
+    }
+    let mut missing_ranges = HashMap::new();
+    for item in &offer.items {
+        let item_missing =
+            journal.missing_ranges(&item.item_id, item.size, offer.job.chunk_profile.piece_size)?;
+        if !item_missing.is_empty() {
+            missing_ranges.insert(item.item_id.clone(), item_missing);
+        }
     }
     let ready = V2DirectReady {
         kind: V2_DIRECT_READY_KIND.to_string(),
         version: SWARM_PROTOCOL_VERSION,
         job_id: offer.job.job_id.clone(),
         offsets,
+        missing_ranges,
     };
     write_v2_frame(stream, &seal_v2_json(channel, &ready, V2_JOB_AAD)?)?;
     let mut completed = 0usize;
     for item in &offer.items {
         let partial = v2_partial_path(&destination, &offer.job.job_id, &item.item_id)?;
         reject_symlink(&partial)?;
-        let mut offset = fs::metadata(&partial)
-            .map(|metadata| metadata.len().min(item.size))
-            .unwrap_or(0);
-        let mut index = offset / offer.job.chunk_profile.piece_size;
-        while offset < item.size {
-            if context
-                .cancelled
-                .lock()
-                .expect("cancel set poisoned")
-                .contains(&offer.job.job_id)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "v2 transfer cancelled",
-                ));
-            }
-            let frame: EncryptedFrame = read_v2_frame(reader)?;
-            let piece: V2DirectPiece = open_v2_json(channel, &frame, V2_PIECE_AAD)?;
-            if piece.kind != V2_DIRECT_PIECE_KIND || piece.version != SWARM_PROTOCOL_VERSION {
-                return Err(invalid("invalid v2 direct piece frame"));
-            }
-            piece
-                .header
-                .validate_against(&offer.job.chunk_profile)
+        let ranges =
+            journal.missing_ranges(&item.item_id, item.size, offer.job.chunk_profile.piece_size)?;
+        validate_v2_missing_ranges(&ranges, item.size, offer.job.chunk_profile.piece_size)?;
+        for range in ranges {
+            let mut offset = range.offset;
+            let range_end = range.offset + range.length;
+            let mut index = offset / offer.job.chunk_profile.piece_size;
+            while offset < range_end {
+                if context
+                    .cancelled
+                    .lock()
+                    .expect("cancel set poisoned")
+                    .contains(&offer.job.job_id)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "v2 transfer cancelled",
+                    ));
+                }
+                let frame: EncryptedFrame = read_v2_frame(reader)?;
+                let piece: V2DirectPiece = open_v2_json(channel, &frame, V2_PIECE_AAD)?;
+                if piece.kind != V2_DIRECT_PIECE_KIND || piece.version != SWARM_PROTOCOL_VERSION {
+                    return Err(invalid("invalid v2 direct piece frame"));
+                }
+                piece
+                    .header
+                    .validate_against(&offer.job.chunk_profile)
+                    .map_err(invalid)?;
+                if piece.header.job_id != offer.job.job_id
+                    || piece.header.object_id != item.item_id
+                    || piece.header.index != index
+                    || piece.header.offset != offset
+                    || piece.header.plaintext_length > range_end.saturating_sub(offset)
+                {
+                    return Err(invalid("v2 direct piece does not match manifest offset"));
+                }
+                let ciphertext = URL_SAFE_NO_PAD.decode(&piece.ciphertext).map_err(invalid)?;
+                let plaintext = open_piece(
+                    &job_key,
+                    &offer.job.snapshot_root,
+                    &piece.header,
+                    &ciphertext,
+                )
                 .map_err(invalid)?;
-            if piece.header.job_id != offer.job.job_id
-                || piece.header.object_id != item.item_id
-                || piece.header.index != index
-                || piece.header.offset != offset
-                || piece.header.plaintext_length > item.size.saturating_sub(offset)
-            {
-                return Err(invalid("v2 direct piece does not match manifest offset"));
+                if plaintext.len() as u64 != piece.header.plaintext_length {
+                    return Err(invalid("v2 direct piece plaintext length mismatch"));
+                }
+                reject_symlink(&partial)?;
+                if let Some(parent) = partial.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .open(&partial)?;
+                file.set_len(item.size)?;
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(&plaintext)?;
+                file.flush()?;
+                journal.mark_verified(
+                    &item.item_id,
+                    &item.sha256,
+                    &item.relative_path,
+                    crate::snapshot::ByteRange {
+                        offset,
+                        length: plaintext.len() as u64,
+                    },
+                )?;
+                journal.save_atomic(&journal_file)?;
+                offset += plaintext.len() as u64;
+                index += 1;
+                total_done += plaintext.len() as u64;
+                emit_progress(
+                    context.app.as_ref(),
+                    &offer.job.job_id,
+                    peer_id,
+                    peer_name,
+                    "receive",
+                    "transferring",
+                    Some(item.relative_path.clone()),
+                    total_done,
+                    offer.total_bytes,
+                    completed,
+                    offer.items.len(),
+                    None,
+                );
             }
-            let ciphertext = URL_SAFE_NO_PAD.decode(&piece.ciphertext).map_err(invalid)?;
-            let plaintext = open_piece(
-                &job_key,
-                &offer.job.snapshot_root,
-                &piece.header,
-                &ciphertext,
-            )
-            .map_err(invalid)?;
-            if plaintext.len() as u64 != piece.header.plaintext_length {
-                return Err(invalid("v2 direct piece plaintext length mismatch"));
-            }
-            reject_symlink(&partial)?;
-            if let Some(parent) = partial.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut file = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .open(&partial)?;
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(&plaintext)?;
-            file.flush()?;
-            journal.mark_verified(
-                &item.item_id,
-                &item.sha256,
-                &item.relative_path,
-                crate::snapshot::ByteRange {
-                    offset,
-                    length: plaintext.len() as u64,
-                },
-            )?;
-            journal.save_atomic(&journal_file)?;
-            offset += plaintext.len() as u64;
-            index += 1;
-            total_done += plaintext.len() as u64;
-            emit_progress(
-                context.app.as_ref(),
-                &offer.job.job_id,
-                peer_id,
-                peer_name,
-                "receive",
-                "transferring",
-                Some(item.relative_path.clone()),
-                total_done,
-                offer.total_bytes,
-                completed,
-                offer.items.len(),
-                None,
-            );
         }
         if digest_file(&partial)? != item.sha256 {
             return Err(invalid("v2 direct file digest mismatch"));
@@ -2423,6 +2478,49 @@ fn build_v2_manifest(
         .collect::<Vec<_>>();
     items.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(items)
+}
+
+#[cfg(feature = "swarm-v2")]
+fn validate_v2_missing_ranges(
+    ranges: &[crate::snapshot::ByteRange],
+    total_bytes: u64,
+    piece_size: u64,
+) -> io::Result<()> {
+    if piece_size == 0 {
+        return Err(invalid("v2 piece size cannot be zero"));
+    }
+    let mut end = 0u64;
+    for range in ranges {
+        if range.length == 0
+            || range.offset < end
+            || range.offset % piece_size != 0
+            || range.length > piece_size
+            || range.offset.checked_add(range.length).is_none()
+            || range.offset + range.length > total_bytes
+        {
+            return Err(invalid("invalid v2 missing range"));
+        }
+        end = range.offset + range.length;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "swarm-v2")]
+fn verify_v2_sources_unchanged(
+    sources: &[TransferSource],
+    manifest: &[ManifestItem],
+) -> io::Result<()> {
+    for item in manifest {
+        let source = source_for_item(sources, item)?;
+        let generation = crate::snapshot::capture_source_generation(&source)?;
+        if generation.size != item.size || generation.sha256 != item.sha256 {
+            return Err(invalid(format!(
+                "source changed since v2 snapshot creation: {}",
+                item.relative_path
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn build_manifest(sources: &[TransferSource]) -> io::Result<Vec<ManifestItem>> {

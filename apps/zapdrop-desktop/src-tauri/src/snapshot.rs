@@ -5,7 +5,7 @@ use crate::swarm::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -16,12 +16,65 @@ use unicode_normalization::UnicodeNormalization;
 
 pub const DEFAULT_SNAPSHOT_PAGE_BYTES: usize = 1024 * 1024;
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
+const DEFAULT_DISK_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_JOURNAL_RANGES: usize = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub struct SnapshotSource {
     pub path: PathBuf,
     pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceGeneration {
+    pub size: u64,
+    pub modified_at_nanos: u128,
+    pub sha256: String,
+}
+
+pub fn capture_source_generation(path: &Path) -> io::Result<SourceGeneration> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(invalid("source generation requires a regular file"));
+    }
+    Ok(SourceGeneration {
+        size: metadata.len(),
+        modified_at_nanos: modified_at_nanos(path)?,
+        sha256: hash_file(path)?,
+    })
+}
+
+pub fn verify_source_generation(path: &Path, expected: &SourceGeneration) -> io::Result<()> {
+    let current = capture_source_generation(path)?;
+    if current != *expected {
+        return Err(invalid("source changed since snapshot creation"));
+    }
+    Ok(())
+}
+
+pub fn disk_space_preflight(
+    destination: &Path,
+    required_bytes: u64,
+    reserve_bytes: Option<u64>,
+) -> io::Result<u64> {
+    let available = fs2::available_space(destination).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("unable to query destination free space: {error}"),
+        )
+    })?;
+    let reserve = reserve_bytes.unwrap_or(DEFAULT_DISK_RESERVE_BYTES);
+    let required = required_bytes
+        .checked_add(reserve)
+        .ok_or_else(|| invalid("disk-space requirement overflow"))?;
+    if available < required {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("insufficient destination space: need {required}, have {available}"),
+        ));
+    }
+    Ok(available)
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +109,136 @@ pub struct SnapshotBuildResult {
     pub directories: Vec<DirectoryNode>,
     pub files: Vec<FileObject>,
     pub piece_pages: Vec<PieceIndexPage>,
+    pub subtree_cache: Vec<SubtreeCacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotObjectRef {
+    pub kind: String,
+    pub object_id: String,
+    pub byte_len: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotMetadataPage {
+    pub kind: String,
+    pub version: u32,
+    pub page_id: String,
+    pub objects: Vec<SnapshotObjectRef>,
+    pub next_page: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtreeCacheEntry {
+    pub relative_path: String,
+    pub object_id: String,
+    pub modified_at_nanos: u128,
+    pub total_bytes: u64,
+    pub total_files: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SubtreeReuseIndex {
+    entries: HashMap<String, SubtreeCacheEntry>,
+}
+
+impl SubtreeReuseIndex {
+    pub fn from_snapshot(snapshot: &SnapshotBuildResult) -> Self {
+        Self {
+            entries: snapshot
+                .subtree_cache
+                .iter()
+                .cloned()
+                .map(|entry| (entry.relative_path.clone(), entry))
+                .collect(),
+        }
+    }
+
+    pub fn reusable(
+        &self,
+        relative_path: &str,
+        modified_at_nanos: u128,
+    ) -> Option<&SubtreeCacheEntry> {
+        self.entries
+            .get(relative_path)
+            .filter(|entry| entry.modified_at_nanos == modified_at_nanos)
+    }
+}
+
+pub fn build_metadata_pages(
+    snapshot: &SnapshotBuildResult,
+    page_bytes: usize,
+) -> io::Result<Vec<SnapshotMetadataPage>> {
+    if !(4 * 1024..=16 * 1024 * 1024).contains(&page_bytes) {
+        return Err(invalid("metadata page size is outside the supported range"));
+    }
+    let mut objects = Vec::new();
+    objects.extend(snapshot.directories.iter().map(|node| {
+        SnapshotObjectRef {
+            kind: "directory".to_string(),
+            object_id: node.object_id.clone(),
+            byte_len: serde_json::to_vec(node)
+                .map(|bytes| bytes.len() as u64)
+                .unwrap_or(0),
+        }
+    }));
+    objects.extend(snapshot.files.iter().map(|file| {
+        SnapshotObjectRef {
+            kind: "file".to_string(),
+            object_id: file.object_id.clone(),
+            byte_len: serde_json::to_vec(file)
+                .map(|bytes| bytes.len() as u64)
+                .unwrap_or(0),
+        }
+    }));
+    objects.extend(snapshot.piece_pages.iter().map(|page| {
+        SnapshotObjectRef {
+            kind: "piece-index".to_string(),
+            object_id: page.page_id.clone(),
+            byte_len: serde_json::to_vec(page)
+                .map(|bytes| bytes.len() as u64)
+                .unwrap_or(0),
+        }
+    }));
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 2usize;
+    for object in objects {
+        let object_bytes = serde_json::to_vec(&object).map_err(invalid)?.len();
+        if object_bytes + 2 > page_bytes {
+            return Err(invalid("metadata object cannot fit in a page"));
+        }
+        let added = object_bytes + usize::from(!current.is_empty());
+        if !current.is_empty() && current_bytes + added > page_bytes {
+            groups.push(current);
+            current = Vec::new();
+            current_bytes = 2;
+        }
+        current.push(object);
+        current_bytes += object_bytes + usize::from(current.len() > 1);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    let mut pages = Vec::with_capacity(groups.len());
+    let mut next = None;
+    for objects in groups.into_iter().rev() {
+        let mut page = SnapshotMetadataPage {
+            kind: "zapdrop_snapshot_metadata_page".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            page_id: "pending".to_string(),
+            objects,
+            next_page: next.clone(),
+        };
+        page.page_id = digest_json(&page)?;
+        next = Some(page.page_id.clone());
+        pages.push(page);
+    }
+    pages.reverse();
+    Ok(pages)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,6 +287,7 @@ pub fn build_snapshot(
     let mut directories = Vec::new();
     let mut files = Vec::new();
     let mut piece_pages = Vec::new();
+    let mut subtree_cache = Vec::new();
     let mut root_entries = Vec::new();
     let mut names = HashSet::new();
     let mut total_bytes = 0u64;
@@ -132,6 +316,7 @@ pub fn build_snapshot(
                 &mut directories,
                 &mut files,
                 &mut piece_pages,
+                &mut subtree_cache,
             )?;
             total_bytes = total_bytes
                 .checked_add(bytes)
@@ -169,6 +354,13 @@ pub fn build_snapshot(
     root_entries.sort_by(|left, right| left.name.cmp(&right.name));
     let root_node = make_directory_node(root_entries)?;
     directories.push(root_node.clone());
+    subtree_cache.push(SubtreeCacheEntry {
+        relative_path: String::new(),
+        object_id: root_node.object_id.clone(),
+        modified_at_nanos: 0,
+        total_bytes,
+        total_files,
+    });
     let node_count = directories.len() as u64 + files.len() as u64 + piece_pages.len() as u64;
     Ok(SnapshotBuildResult {
         root: SnapshotRoot {
@@ -185,6 +377,7 @@ pub fn build_snapshot(
         directories,
         files,
         piece_pages,
+        subtree_cache,
     })
 }
 
@@ -196,6 +389,7 @@ fn build_directory(
     directories: &mut Vec<DirectoryNode>,
     files: &mut Vec<FileObject>,
     piece_pages: &mut Vec<PieceIndexPage>,
+    subtree_cache: &mut Vec<SubtreeCacheEntry>,
 ) -> io::Result<(DirectoryNode, u64, u64)> {
     let mut entries = Vec::new();
     let mut names = HashSet::new();
@@ -222,6 +416,7 @@ fn build_directory(
                 directories,
                 files,
                 piece_pages,
+                subtree_cache,
             )?;
             total_bytes = total_bytes
                 .checked_add(bytes)
@@ -253,6 +448,13 @@ fn build_directory(
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     let node = make_directory_node(entries)?;
     directories.push(node.clone());
+    subtree_cache.push(SubtreeCacheEntry {
+        relative_path: relative.to_string(),
+        object_id: node.object_id.clone(),
+        modified_at_nanos: modified_at_nanos(path)?,
+        total_bytes,
+        total_files,
+    });
     Ok((node, total_bytes, total_files))
 }
 
@@ -512,6 +714,90 @@ impl TransferJournal {
             item.complete = true;
         }
     }
+
+    pub fn reset_item(&mut self, object_id: &str) {
+        self.items.retain(|item| item.object_id != object_id);
+    }
+
+    pub fn verified_bytes(&self, object_id: &str, total_bytes: u64) -> u64 {
+        total_bytes.saturating_sub(
+            self.missing_ranges(object_id, total_bytes, total_bytes.max(1))
+                .map(|ranges| ranges.iter().map(|range| range.length).sum())
+                .unwrap_or(total_bytes),
+        )
+    }
+
+    pub fn contiguous_offset(&self, object_id: &str, total_bytes: u64) -> u64 {
+        let Some(item) = self.items.iter().find(|item| item.object_id == object_id) else {
+            return 0;
+        };
+        let mut ranges = item.verified_ranges.clone();
+        ranges.sort_by_key(|range| range.offset);
+        let mut cursor = 0u64;
+        for range in ranges {
+            if range.offset > cursor {
+                break;
+            }
+            cursor = cursor.max(range.offset.saturating_add(range.length));
+            if cursor >= total_bytes {
+                return total_bytes;
+            }
+        }
+        cursor.min(total_bytes)
+    }
+
+    pub fn missing_ranges(
+        &self,
+        object_id: &str,
+        total_bytes: u64,
+        piece_size: u64,
+    ) -> io::Result<Vec<ByteRange>> {
+        if piece_size == 0 {
+            return Err(invalid("piece size cannot be zero"));
+        }
+        let Some(item) = self.items.iter().find(|item| item.object_id == object_id) else {
+            return Ok(vec![ByteRange {
+                offset: 0,
+                length: total_bytes,
+            }]);
+        };
+        let mut ranges = item.verified_ranges.clone();
+        ranges.sort_by_key(|range| range.offset);
+        let mut cursor = 0u64;
+        let mut missing = Vec::new();
+        for range in ranges {
+            let start = range.offset.min(total_bytes);
+            if start > cursor {
+                missing.push(ByteRange {
+                    offset: cursor,
+                    length: start - cursor,
+                });
+            }
+            cursor = cursor.max(start.saturating_add(range.length).min(total_bytes));
+        }
+        if cursor < total_bytes {
+            missing.push(ByteRange {
+                offset: cursor,
+                length: total_bytes - cursor,
+            });
+        }
+        Ok(missing
+            .into_iter()
+            .flat_map(|range| split_range(range, piece_size))
+            .collect())
+    }
+}
+
+fn split_range(range: ByteRange, piece_size: u64) -> Vec<ByteRange> {
+    let mut result = Vec::new();
+    let mut offset = range.offset;
+    let end = range.offset.saturating_add(range.length);
+    while offset < end {
+        let length = (end - offset).min(piece_size);
+        result.push(ByteRange { offset, length });
+        offset = offset.saturating_add(length);
+    }
+    result
 }
 
 pub fn journal_path(root: &Path, job_id: &str) -> PathBuf {
@@ -536,6 +822,14 @@ fn epoch_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn modified_at_nanos(path: &Path) -> io::Result<u128> {
+    let modified = fs::metadata(path)?.modified().unwrap_or(UNIX_EPOCH);
+    Ok(modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos())
 }
 
 fn invalid(error: impl ToString) -> io::Error {
@@ -576,6 +870,86 @@ mod tests {
         );
         assert!(normalize_relative_path("../escape").is_err());
         assert!(normalize_relative_path("a\\b").is_err());
+    }
+
+    #[test]
+    fn builds_bounded_metadata_pages_and_reuses_exact_subtree_generation() {
+        let root = std::env::temp_dir().join(format!("zapdrop-metadata-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("folder")).unwrap();
+        fs::write(root.join("folder/file.txt"), b"payload").unwrap();
+        let snapshot = build_snapshot(
+            &[SnapshotSource {
+                path: root.join("folder"),
+                relative_path: "folder".to_string(),
+            }],
+            &SnapshotOptions::default(),
+        )
+        .unwrap();
+        let pages = build_metadata_pages(&snapshot, 4096).unwrap();
+        assert!(!pages.is_empty());
+        assert!(pages.iter().all(|page| page.page_id.len() == 64));
+        let cache = SubtreeReuseIndex::from_snapshot(&snapshot);
+        let entry = snapshot
+            .subtree_cache
+            .iter()
+            .find(|entry| entry.relative_path == "folder")
+            .unwrap();
+        assert!(cache.reusable("folder", entry.modified_at_nanos).is_some());
+        assert!(cache
+            .reusable("folder", entry.modified_at_nanos.saturating_add(1))
+            .is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detects_source_mutation_and_preflights_destination_space() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-generation-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        fs::write(&source, b"original").unwrap();
+        let generation = capture_source_generation(&source).unwrap();
+        disk_space_preflight(&root, 1, Some(1)).unwrap();
+        fs::write(&source, b"changed").unwrap();
+        assert!(verify_source_generation(&source, &generation).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn journal_exposes_contiguous_and_sparse_missing_ranges() {
+        let mut journal = TransferJournal::new("job-1".to_string(), "root-1".to_string());
+        journal
+            .mark_verified(
+                "object-1",
+                "a".repeat(64).as_str(),
+                "file.bin",
+                ByteRange {
+                    offset: 0,
+                    length: 4,
+                },
+            )
+            .unwrap();
+        journal
+            .mark_verified(
+                "object-1",
+                "a".repeat(64).as_str(),
+                "file.bin",
+                ByteRange {
+                    offset: 8,
+                    length: 4,
+                },
+            )
+            .unwrap();
+        assert_eq!(journal.contiguous_offset("object-1", 16), 4);
+        assert_eq!(
+            journal
+                .missing_ranges("object-1", 16, 4)
+                .unwrap()
+                .iter()
+                .map(|range| (range.offset, range.length))
+                .collect::<Vec<_>>(),
+            vec![(4, 4), (12, 4)]
+        );
     }
 
     #[test]
