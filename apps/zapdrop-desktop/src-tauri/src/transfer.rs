@@ -2007,18 +2007,15 @@ fn receive_v2_direct_inner(
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         let journal_offset = journal.contiguous_offset(&item.item_id, item.size);
-        let mut offset = partial_offset;
-        if partial_offset != 0 && journal_offset == 0 {
+        let (offset, reset_journal) = v2_reconcile_partial_state(
+            partial_offset,
+            journal_offset,
+            item.size,
+            offer.job.chunk_profile.piece_size,
+        );
+        if reset_journal {
             let _ = fs::remove_file(&partial);
-            offset = 0;
-        }
-        if journal_offset != 0 && journal_offset != partial_offset && partial_offset != item.size {
-            let _ = fs::remove_file(&partial);
-            offset = 0;
-        }
-        if offset > item.size || offset % offer.job.chunk_profile.piece_size != 0 {
-            let _ = fs::remove_file(&partial);
-            offset = 0;
+            journal.reset_item(&item.item_id);
         }
         offsets.insert(item.item_id.clone(), offset);
         total_done = total_done.saturating_add(journal.verified_bytes(&item.item_id, item.size));
@@ -2719,6 +2716,25 @@ fn build_v2_manifest(
         .collect::<Vec<_>>();
     items.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(items)
+}
+
+#[cfg(feature = "swarm-v2")]
+fn v2_reconcile_partial_state(
+    partial_offset: u64,
+    journal_offset: u64,
+    item_size: u64,
+    piece_size: u64,
+) -> (u64, bool) {
+    if partial_offset != 0 && journal_offset == 0
+        || journal_offset != 0 && journal_offset != partial_offset && partial_offset != item_size
+        || partial_offset > item_size
+        || piece_size == 0
+        || partial_offset % piece_size != 0
+    {
+        (0, true)
+    } else {
+        (partial_offset, false)
+    }
 }
 
 #[cfg(feature = "swarm-v2")]
@@ -3736,6 +3752,29 @@ mod tests {
                 })
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "swarm-v2")]
+    #[test]
+    fn secure_v2_partial_state_mismatch_resets_stale_journal() {
+        let piece_size = crate::swarm::DEFAULT_PIECE_SIZE;
+        assert_eq!(
+            v2_reconcile_partial_state(piece_size, 0, 2 * piece_size, piece_size),
+            (0, true)
+        );
+        assert_eq!(
+            v2_reconcile_partial_state(2 * piece_size, piece_size, 3 * piece_size, piece_size),
+            (0, true)
+        );
+        assert_eq!(
+            v2_reconcile_partial_state(3 * piece_size, piece_size, 3 * piece_size, piece_size),
+            (3 * piece_size, false)
+        );
+        assert_eq!(
+            v2_reconcile_partial_state(1, 0, piece_size, piece_size),
+            (0, true)
+        );
+        assert_eq!(v2_reconcile_partial_state(0, 0, 1, 0), (0, true));
     }
 
     #[cfg(feature = "swarm-v2")]
