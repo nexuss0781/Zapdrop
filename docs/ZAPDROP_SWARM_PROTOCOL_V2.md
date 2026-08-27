@@ -142,7 +142,7 @@ Both endpoints compute the X25519 shared secret and a deterministic transcript h
 
 A fresh 256-bit job key is generated per swarm job. The sender provisions it to each authorized recipient by encrypting it under the established directional channel key. The job-key envelope binds the job ID, snapshot root, key ID, and exact recipient ID as authenticated associated data. The content key itself is never serialized as plaintext. Encrypted piece headers bind the job, snapshot root, piece, object, index, offset, and plaintext length as authenticated associated data; ciphertext length and ciphertext SHA-256 are checked before decryption and staging writes.
 
-This application channel is an implementation foundation and is not a TLS 1.3 deployment. The `swarm-v2` feature now integrates a secure hello/proof exchange into the real TCP listener, an opt-in sender probe through `ZAPDROP_SWARM_V2_PROBE`, and a feature-gated encrypted direct-file exchange through `ZAPDROP_SWARM_V2_DIRECT`. The direct exchange sends the signed job and manifest before approval but provisions the per-job content key only after the receiver accepts the job. The active v1 transfer path remains the default and unchanged. The next security slice must add UI-backed manual v2 approval, explicit re-handshake/rekey orchestration, receive history/progress integration, and packet-capture and physical-LAN qualification before v2 is enabled by default.
+This application channel is an implementation foundation and is not a TLS 1.3 deployment. The `swarm-v2` feature now integrates a secure hello/proof exchange into the real TCP listener, an opt-in sender probe through `ZAPDROP_SWARM_V2_PROBE`, and a feature-gated encrypted direct-file exchange through `ZAPDROP_SWARM_V2_DIRECT`. The direct exchange sends the signed job and manifest before approval but provisions the per-job content key only after the receiver accepts the job. After key provisioning, the receiver sends an encrypted ready frame containing validated piece-aligned offsets for each item; the sender seeks to those offsets and resumes from the corresponding piece index. Existing partial bytes are retained only at valid piece boundaries and the final full-file SHA-256 check remains authoritative. The active v1 transfer path remains the default and unchanged. The next security slice must add explicit re-handshake/rekey orchestration, sender-side v2 progress integration, and packet-capture and physical-LAN qualification before v2 is enabled by default.
 
 ## 6. Capability and control objects
 
@@ -177,6 +177,7 @@ The initial v2 control frame kinds are:
 | `zapdrop_swarm_offer` | receiver → local UI | Holds the job for local acceptance before data access |
 | `zapdrop_swarm_accept` | receiver → sender | Returns capability acknowledgement and selected destination policy |
 | `zapdrop_swarm_reject` | receiver → sender | Refuses the job without writing data |
+| `zapdrop_swarm_direct_ready` | receiver → sender | Returns encrypted, piece-aligned resume offsets after approval and key provisioning |
 | `zapdrop_snapshot_root` | sender → receiver | Commits the content graph |
 | `zapdrop_index_request` | receiver → sender | Requests a bounded root/directory/file index page |
 | `zapdrop_index_page` | sender → receiver | Returns a bounded metadata page |
@@ -219,7 +220,7 @@ TRANSFERRING
 COMPLETED
 ```
 
-No receiver writes a final destination while in `OFFERED`. Staging allocation is permitted only after authorization and destination validation. A receiver may reject a job because of user policy, disk space, conflicts, expired capability, unsupported profile, or security failure. Error codes must be stable enough for the UI and history layer to distinguish retryable network failures from permanent content or authorization failures.
+No receiver writes a final destination while in `OFFERED`. Staging allocation is permitted only after authorization and destination validation. In the direct profile, the receiver sends `zapdrop_swarm_direct_ready` only after approval and successful job-key unwrapping; its offsets are bounded by the manifest and aligned to the negotiated piece profile. A receiver may reject a job because of user policy, disk space, conflicts, expired capability, unsupported profile, or security failure. Error codes must be stable enough for the UI and history layer to distinguish retryable network failures from permanent content or authorization failures.
 
 ## 8. Chunk profile v2 initial values
 
@@ -245,7 +246,7 @@ A v2 implementation may use the existing signed device identity and trusted-peer
 
 The first implementation slice adds Rust serialization models, bounded validation, canonical identifier helpers, and unit tests. It does not change the active v1 transfer engine.
 
-The secure-channel foundation adds signed ephemeral handshakes, directional key derivation, profile negotiation, bounded rekey limits, fresh job-key provisioning, snapshot-bound authenticated data, replay protection, and AEAD tests. The `swarm-v2` feature now runs a real TCP listener probe, encrypted proof exchange, and one direct file-transfer path using encrypted job, decision, key-provision, piece, and completion frames. The default v1 path remains active until the v2 path receives UI-backed approval, progress/history integration, packet-capture evidence, and physical-LAN qualification.
+The secure-channel foundation adds signed ephemeral handshakes, directional key derivation, profile negotiation, bounded rekey limits, fresh job-key provisioning, snapshot-bound authenticated data, replay protection, and AEAD tests. The `swarm-v2` feature now runs a real TCP listener probe, encrypted proof exchange, and one direct file-transfer path using encrypted job, decision, key-provision, ready, piece, and completion frames. Pending v2 offers use the existing UI approval surface, and receive-side v2 transfers record history and emit progress events. The default v1 path remains active until sender-side v2 progress, explicit re-handshake/rekey orchestration, packet-capture evidence, and physical-LAN qualification are complete.
 
 Tree/mesh forwarding, RaptorQ repair, privacy relays, and adaptive congestion-control selection are later protocol extensions. They must not be enabled by default until direct v2 transfer, large-file resume, revocation, and physical-LAN tests are complete.
 
@@ -253,4 +254,4 @@ Tree/mesh forwarding, RaptorQ repair, privacy relays, and adaptive congestion-co
 
 The initial protocol foundation is complete when all model types round-trip through JSON, invalid versions and kinds fail, duplicate recipients and malformed identifiers fail, capabilities cannot exceed job expiry, piece lengths and offsets are bounded, canonical snapshot objects reject duplicate children and unsafe paths, and v1 tests remain green. The secure-channel foundation additionally requires valid signed handshakes, trusted identity matching, directional key agreement, replay rejection, AAD tamper rejection, job-key envelope binding, and encrypted-piece snapshot binding; these tests are now implemented in `src-tauri/src/secure.rs`.
 
-The secure-channel milestone is complete when a packet capture contains no readable payload, the receiver rejects a changed sender key, replayed capabilities fail, rejected or expired jobs write no file, a valid encrypted piece can be verified independently, the v2 loopback direct-file test succeeds, and an approval-rejection test proves no destination bytes are written.
+The secure-channel milestone is complete when a packet capture contains no readable payload, the receiver rejects a changed sender key, replayed capabilities fail, rejected or expired jobs write no file, a valid encrypted piece can be verified independently, the v2 loopback direct-file test succeeds with explicit approval, resume offsets are negotiated inside the encrypted channel, and rejection/integrity regression tests prove no unauthorized or corrupted content is committed.
