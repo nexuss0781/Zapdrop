@@ -13,7 +13,7 @@ docs/                   Architecture and implementation research
 
 Phase 1 is complete: the Tauri desktop shell, React dashboard, Rust bridge, capabilities, icon assets, and project scripts are present.
 
-Phase 2 is in progress: persistent settings, stable device identity, protected private-key storage, mDNS/DNS-SD discovery, peer state events, and manual endpoint fallback.
+Phase 2 is complete: persistent settings, stable device identity, protected private-key storage, mDNS/DNS-SD discovery, peer state events, diagnostics, and manual endpoint fallback are implemented. See `docs/ZAPDROP_PHASE2_STATUS.md` for the verification record and Phase 3 contract.
 
 ## Development
 
