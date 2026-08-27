@@ -93,3 +93,60 @@ jobs:
           generate_release_notes: true
           files: release-staging/*.exe
           fail_on_unmatched_files: true
+
+
+  windows-smoke-test:
+    name: Launch Windows executable and capture screenshot
+    needs: windows-release
+    runs-on: windows-latest
+
+    steps:
+      - name: Download the Windows release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zapdrop-windows-${{ github.run_number }}
+          path: smoke-artifact
+
+      - name: Launch Zapdrop and capture the desktop
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+
+          $portable = Get-ChildItem "smoke-artifact" -Recurse -Filter "*portable.exe" | Select-Object -First 1
+          if ($null -eq $portable) {
+            throw "The portable Zapdrop executable was not found in the downloaded artifact."
+          }
+
+          $process = Start-Process -FilePath $portable.FullName -WorkingDirectory $portable.DirectoryName -PassThru
+          try {
+            Start-Sleep -Seconds 12
+            if ($process.HasExited) {
+              throw "Zapdrop exited before the smoke-test screenshot could be captured (exit code $($process.ExitCode))."
+            }
+
+            $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bitmap = New-Object System.Drawing.Bitmap($screen.Width, $screen.Height)
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            try {
+              $graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
+              $bitmap.Save("zapdrop-smoke-screenshot.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            }
+            finally {
+              $graphics.Dispose()
+              $bitmap.Dispose()
+            }
+          }
+          finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+      - name: Upload the smoke-test screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: zapdrop-windows-smoke-screenshot-${{ github.run_number }}
+          path: zapdrop-smoke-screenshot.png
+          if-no-files-found: error
+          retention-days: 30
