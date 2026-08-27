@@ -92,7 +92,7 @@ impl RuntimeState {
 
     pub fn transfer_context(&self, app: &AppHandle) -> TransferServerContext {
         TransferServerContext {
-            app: app.clone(),
+            app: Some(app.clone()),
             identity: self.identity.clone(),
             store: self.store.clone(),
             trust: self.trust.clone(),

@@ -150,3 +150,38 @@ jobs:
           path: zapdrop-smoke-screenshot.png
           if-no-files-found: error
           retention-days: 30
+
+
+  windows-bidirectional-transfer-test:
+    name: Concurrent bidirectional transfer test
+    needs: windows-release
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out Zapdrop
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the frontend test payload
+        run: pnpm --dir $env:APP_DIR build
+
+      - name: Run simultaneous A-to-B and B-to-A transfer test
+        run: cargo test --manifest-path $env:TAURI_DIR/Cargo.toml --lib transfer::tests::bidirectional_concurrent_loopback_transfer -- --nocapture

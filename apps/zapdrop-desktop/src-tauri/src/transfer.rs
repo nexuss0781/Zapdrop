@@ -263,7 +263,7 @@ impl ReceiveOfferCoordinator {
             error: None,
         });
         emit_progress(
-            &context.app,
+            context.app.as_ref(),
             &manifest.transfer_id,
             &pending.peer_id,
             &pending.peer_name,
@@ -324,7 +324,7 @@ impl ReceiveOfferCoordinator {
 
 #[derive(Clone)]
 pub struct TransferServerContext {
-    pub app: AppHandle,
+    pub app: Option<AppHandle>,
     pub identity: DeviceIdentity,
     pub store: SettingsStore,
     pub trust: TrustedPeerStore,
@@ -478,7 +478,7 @@ impl TransferManager {
                 .name(format!("zapdrop-transfer-{}", peer.id))
                 .spawn(move || {
                     let result = send_to_peer(
-                        &app,
+                        Some(&app),
                         &identity,
                         &store,
                         &device_name,
@@ -628,7 +628,9 @@ pub fn handle_incoming(
         peer_name,
         received_at,
     });
-    let _ = context.app.emit("incoming-transfer-offer", offer);
+    if let Some(app) = context.app.as_ref() {
+        let _ = app.emit("incoming-transfer-offer", offer);
+    }
     if !context.always_ask_before_receive {
         let _ = context.offers.accept(
             &transfer_id,
@@ -641,7 +643,7 @@ pub fn handle_incoming(
 }
 
 fn send_to_peer(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     identity: &DeviceIdentity,
     store: &SettingsStore,
     device_name: &str,
@@ -801,7 +803,7 @@ fn receive_items(
             offset += data.len() as u64;
             total_done += data.len() as u64;
             emit_progress(
-                &context.app,
+                context.app.as_ref(),
                 &manifest.transfer_id,
                 peer_id,
                 peer_name,
@@ -834,7 +836,7 @@ fn receive_items(
 
         completed += 1;
         emit_progress(
-            &context.app,
+            context.app.as_ref(),
             &manifest.transfer_id,
             peer_id,
             peer_name,
@@ -922,7 +924,9 @@ fn finish_received_transfer(
     } else {
         "transfer-failed"
     };
-    let _ = context.app.emit(event, progress);
+    if let Some(app) = context.app.as_ref() {
+        let _ = app.emit(event, progress);
+    }
 }
 
 fn normalize_conflict_policy(policy: &str) -> io::Result<String> {
@@ -1257,7 +1261,7 @@ fn fingerprint(public_key: &[u8; 32]) -> String {
         .join(":")
 }
 fn emit_progress(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     transfer_id: &str,
     peer_id: &str,
     peer_name: &str,
@@ -1270,6 +1274,9 @@ fn emit_progress(
     total_items: usize,
     error: Option<String>,
 ) {
+    let Some(app) = app else {
+        return;
+    };
     let _ = app.emit(
         "transfer-progress",
         TransferProgress {
@@ -1346,8 +1353,20 @@ fn epoch_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{destination_path, validate_relative_path};
-    use std::{fs, path::PathBuf};
+    use super::*;
+    use crate::{
+        history::HistoryStore,
+        identity::DeviceIdentity,
+        settings::SettingsStore,
+        trust::{TrustedPeer, TrustedPeerStore},
+    };
+    use std::{
+        fs,
+        net::TcpListener,
+        path::PathBuf,
+        sync::{Arc, Barrier, Mutex},
+        thread,
+    };
     #[test]
     fn rejects_traversal() {
         assert!(validate_relative_path("../escape.txt").is_err());
@@ -1371,5 +1390,199 @@ mod tests {
             .is_none());
         assert!(destination_path(&root, "file.txt", "invalid").is_err());
         fs::remove_dir_all(PathBuf::from(root)).unwrap();
+    }
+
+    #[test]
+    fn bidirectional_concurrent_loopback_transfer() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-bidirectional-{}", uuid::Uuid::new_v4()));
+        let data_a = root.join("peer-a-data");
+        let data_b = root.join("peer-b-data");
+        let source_a = root.join("from-a.txt");
+        let source_b = root.join("from-b.txt");
+        let receive_a = root.join("peer-a-received");
+        let receive_b = root.join("peer-b-received");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source_a, b"hello from peer A\n").unwrap();
+        fs::write(&source_b, b"hello from peer B\n").unwrap();
+
+        let store_a = SettingsStore::new(data_a);
+        let store_b = SettingsStore::new(data_b);
+        let identity_a = DeviceIdentity::load_or_create(&store_a).unwrap();
+        let identity_b = DeviceIdentity::load_or_create(&store_b).unwrap();
+        let trust_a = TrustedPeerStore::load(&store_a).unwrap();
+        let trust_b = TrustedPeerStore::load(&store_b).unwrap();
+        trust_a
+            .upsert(TrustedPeer {
+                version: 1,
+                peer_id: identity_b.device_id.clone(),
+                name: "Peer B".to_string(),
+                public_key: identity_b.public_key.clone(),
+                fingerprint: identity_b.fingerprint.clone(),
+                first_seen: 1,
+                last_seen: 1,
+                endpoint: "127.0.0.1:0".to_string(),
+            })
+            .unwrap();
+        trust_b
+            .upsert(TrustedPeer {
+                version: 1,
+                peer_id: identity_a.device_id.clone(),
+                name: "Peer A".to_string(),
+                public_key: identity_a.public_key.clone(),
+                fingerprint: identity_a.fingerprint.clone(),
+                first_seen: 1,
+                last_seen: 1,
+                endpoint: "127.0.0.1:0".to_string(),
+            })
+            .unwrap();
+
+        let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint_a = listener_a.local_addr().unwrap();
+        let endpoint_b = listener_b.local_addr().unwrap();
+        let context_a = test_context(
+            identity_a.clone(),
+            store_a.clone(),
+            trust_a,
+            receive_a.clone(),
+            "Peer A",
+        );
+        let context_b = test_context(
+            identity_b.clone(),
+            store_b.clone(),
+            trust_b,
+            receive_b.clone(),
+            "Peer B",
+        );
+        let receiver_a = thread::spawn(move || {
+            let (stream, address) = listener_a.accept().unwrap();
+            let first: serde_json::Value = read_json_line(&stream).unwrap();
+            handle_incoming(stream, address, first, context_a);
+        });
+        let receiver_b = thread::spawn(move || {
+            let (stream, address) = listener_b.accept().unwrap();
+            let first: serde_json::Value = read_json_line(&stream).unwrap();
+            handle_incoming(stream, address, first, context_b);
+        });
+        let peer_a = PeerRecord {
+            id: identity_a.device_id.clone(),
+            name: "Peer A".to_string(),
+            platform: "windows".to_string(),
+            fingerprint: Some(identity_a.fingerprint.clone()),
+            public_key: Some(identity_a.public_key.clone()),
+            endpoint: endpoint_a.to_string(),
+            port: endpoint_a.port(),
+            status: "trusted".to_string(),
+            discovered_via: "loopback-test".to_string(),
+            last_seen: epoch_seconds(),
+            trusted: true,
+        };
+        let peer_b = PeerRecord {
+            id: identity_b.device_id.clone(),
+            name: "Peer B".to_string(),
+            platform: "windows".to_string(),
+            fingerprint: Some(identity_b.fingerprint.clone()),
+            public_key: Some(identity_b.public_key.clone()),
+            endpoint: endpoint_b.to_string(),
+            port: endpoint_b.port(),
+            status: "trusted".to_string(),
+            discovered_via: "loopback-test".to_string(),
+            last_seen: epoch_seconds(),
+            trusted: true,
+        };
+        let barrier = Arc::new(Barrier::new(2));
+        let manager_a = TransferManager::new(HistoryStore::load(&store_a).unwrap());
+        let manager_b = TransferManager::new(HistoryStore::load(&store_b).unwrap());
+        let source_a_path = source_a.to_string_lossy().to_string();
+        let source_b_path = source_b.to_string_lossy().to_string();
+        let barrier_a = Arc::clone(&barrier);
+        let sender_a = thread::spawn(move || {
+            barrier_a.wait();
+            send_to_peer(
+                None,
+                &identity_a,
+                &store_a,
+                "Peer A",
+                &peer_b,
+                &[TransferSource {
+                    path: source_a_path,
+                    relative_path: Some("from-a.txt".to_string()),
+                }],
+                "rename",
+                "transfer-a-to-b",
+                18,
+                &manager_a,
+            )
+        });
+        let barrier_b = Arc::clone(&barrier);
+        let sender_b = thread::spawn(move || {
+            barrier_b.wait();
+            send_to_peer(
+                None,
+                &identity_b,
+                &store_b,
+                "Peer B",
+                &peer_a,
+                &[TransferSource {
+                    path: source_b_path,
+                    relative_path: Some("from-b.txt".to_string()),
+                }],
+                "rename",
+                "transfer-b-to-a",
+                18,
+                &manager_b,
+            )
+        });
+        sender_a.join().unwrap().unwrap();
+        sender_b.join().unwrap().unwrap();
+        receiver_a.join().unwrap();
+        receiver_b.join().unwrap();
+        assert_eq!(
+            fs::read(receive_a.join("from-b.txt")).unwrap(),
+            b"hello from peer B\n"
+        );
+        assert_eq!(
+            fs::read(receive_b.join("from-a.txt")).unwrap(),
+            b"hello from peer A\n"
+        );
+        assert!(
+            HistoryStore::load(&SettingsStore::new(root.join("peer-a-data")))
+                .unwrap()
+                .list()
+                .iter()
+                .any(|entry| entry.transfer_id == "transfer-b-to-a" && entry.status == "completed")
+        );
+        assert!(
+            HistoryStore::load(&SettingsStore::new(root.join("peer-b-data")))
+                .unwrap()
+                .list()
+                .iter()
+                .any(|entry| entry.transfer_id == "transfer-a-to-b" && entry.status == "completed")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_context(
+        identity: DeviceIdentity,
+        store: SettingsStore,
+        trust: TrustedPeerStore,
+        receive_directory: PathBuf,
+        device_name: &str,
+    ) -> TransferServerContext {
+        let history = HistoryStore::load(&store).unwrap();
+        TransferServerContext {
+            app: None,
+            identity,
+            store,
+            trust,
+            device_name: device_name.to_string(),
+            receive_directory: receive_directory.to_string_lossy().to_string(),
+            cancelled: Arc::new(Mutex::new(HashSet::new())),
+            history,
+            offers: ReceiveOfferCoordinator::new(),
+            always_ask_before_receive: false,
+            default_conflict_policy: "rename".to_string(),
+        }
     }
 }
