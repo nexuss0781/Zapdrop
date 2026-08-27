@@ -1263,8 +1263,19 @@ fn send_v2_direct(
     if proof_bytes != b"zapdrop-v2-secure-ready" {
         return Err(invalid("secure handshake proof mismatch"));
     }
-    let manifest = build_manifest(sources)?;
-    let total_bytes = manifest.iter().map(|item| item.size).sum::<u64>();
+    let profile = ChunkProfile {
+        profile_id: "fixed-4m-sha256-aead".to_string(),
+        piece_size: crate::swarm::DEFAULT_PIECE_SIZE,
+        max_in_flight_pieces: 8,
+        hash: "sha256".to_string(),
+        aead: "x25519-hkdf-sha256-chacha20poly1305".to_string(),
+    };
+    let manifest = build_v2_manifest(sources, &profile)?;
+    let total_bytes = manifest.iter().try_fold(0u64, |total, item| {
+        total
+            .checked_add(item.size)
+            .ok_or_else(|| invalid("v2 manifest size overflow"))
+    })?;
     let (job, job_key) = create_v2_job(identity, transfer_id, &peer.id, &manifest, &signing_key)?;
     let offer = V2DirectOffer {
         kind: V2_DIRECT_OFFER_KIND.to_string(),
@@ -1646,6 +1657,27 @@ fn receive_v2_direct_inner(
             &context.identity.device_id,
         )
         .map_err(invalid)?;
+    let journal_file = crate::snapshot::journal_path(&destination, &offer.job.job_id);
+    let mut journal = match crate::snapshot::TransferJournal::load(&journal_file) {
+        Ok(existing)
+            if existing.job_id == offer.job.job_id
+                && existing.snapshot_root == offer.job.snapshot_root =>
+        {
+            existing
+        }
+        Ok(_) => crate::snapshot::TransferJournal::new(
+            offer.job.job_id.clone(),
+            offer.job.snapshot_root.clone(),
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            crate::snapshot::TransferJournal::new(
+                offer.job.job_id.clone(),
+                offer.job.snapshot_root.clone(),
+            )
+        }
+        Err(error) => return Err(error),
+    };
+    journal.save_atomic(&journal_file)?;
     let mut offsets = HashMap::new();
     let mut total_done = 0u64;
     for item in &offer.items {
@@ -1728,6 +1760,16 @@ fn receive_v2_direct_inner(
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(&plaintext)?;
             file.flush()?;
+            journal.mark_verified(
+                &item.item_id,
+                &item.sha256,
+                &item.relative_path,
+                crate::snapshot::ByteRange {
+                    offset,
+                    length: plaintext.len() as u64,
+                },
+            )?;
+            journal.save_atomic(&journal_file)?;
             offset += plaintext.len() as u64;
             index += 1;
             total_done += plaintext.len() as u64;
@@ -1753,8 +1795,11 @@ fn receive_v2_direct_inner(
             if let Some(parent) = final_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::rename(partial, final_path)?;
+            reject_symlink(&final_path)?;
+            fs::rename(&partial, &final_path)?;
         }
+        journal.mark_complete(&item.item_id, &item.sha256, &item.relative_path);
+        journal.save_atomic(&journal_file)?;
         completed += 1;
         emit_progress(
             context.app.as_ref(),
@@ -2281,6 +2326,49 @@ fn validate_manifest(manifest: &TransferManifest, transfer_id: &str) -> io::Resu
         return Err(invalid("manifest total size mismatch"));
     }
     Ok(())
+}
+
+#[cfg(feature = "swarm-v2")]
+fn build_v2_manifest(
+    sources: &[TransferSource],
+    profile: &ChunkProfile,
+) -> io::Result<Vec<ManifestItem>> {
+    let snapshot_sources = sources
+        .iter()
+        .map(|source| {
+            let path = PathBuf::from(&source.path);
+            let relative_path = source.relative_path.clone().unwrap_or_else(|| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            });
+            crate::snapshot::SnapshotSource {
+                path,
+                relative_path,
+            }
+        })
+        .collect::<Vec<_>>();
+    let snapshot = crate::snapshot::build_snapshot(
+        &snapshot_sources,
+        &crate::snapshot::SnapshotOptions {
+            chunk_profile: profile.clone(),
+            page_bytes: crate::snapshot::DEFAULT_SNAPSHOT_PAGE_BYTES,
+        },
+    )?;
+    let mut items = snapshot
+        .files
+        .into_iter()
+        .map(|file| ManifestItem {
+            item_id: stable_item_id(&file.relative_path),
+            relative_path: file.relative_path,
+            kind: "file".to_string(),
+            size: file.size,
+            sha256: file.sha256,
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(items)
 }
 
 fn build_manifest(sources: &[TransferSource]) -> io::Result<Vec<ManifestItem>> {

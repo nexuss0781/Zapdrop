@@ -6,6 +6,7 @@ mod network;
 mod pairing;
 pub mod secure;
 mod settings;
+pub mod snapshot;
 pub mod swarm;
 mod transfer;
 mod trust;

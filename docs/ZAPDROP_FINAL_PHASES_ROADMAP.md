@@ -127,7 +127,9 @@ Implement `SwarmJob`, snapshot roots, signed recipient capabilities, protocol-ve
 
 **Objective:** Replace eager monolithic manifests with streaming, incremental, verifiable folder snapshots.
 
-Implement canonical directory nodes, file chunk objects, snapshot roots, paged metadata exchange, deduplication within a job, Unicode and path normalization, millions-of-entry stress tests, 64-bit file sizes, disk-space preflight, staging journals, crash recovery, source-change detection, and atomic finalization.
+**Implementation status:** The first foundation slice is implemented. It provides bounded file hashing, canonical NFC Unicode path normalization, traversal and symlink rejection, deterministic directory ordering, content-addressed directory/file/piece-index objects, bounded chained piece-index pages, and crash-safe job-scoped transfer journals. The feature-gated v2 direct sender now derives its file manifest from the snapshot engine, and the v2 receiver persists authenticated ranges and completion state in the journal.
+
+The remaining Phase 7 work is a network paged-metadata exchange for very large trees, subtree reuse across snapshots, millions-of-entry stress qualification, disk-space preflight, sparse-range recovery, explicit source mutation revisions, and 4 GiB-plus physical-file testing. See `docs/ZAPDROP_PHASE7_STATUS.md` for the exact boundary of the implemented slice.
 
 **Acceptance gate:** A large folder can be indexed and transferred without memory scaling with total dataset size; unchanged subtrees are reused; a 4 GB-plus file resumes after termination; and altered source content cannot silently merge into an old job.
 
