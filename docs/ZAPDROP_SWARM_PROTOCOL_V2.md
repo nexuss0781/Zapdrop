@@ -1,9 +1,9 @@
 # Zapdrop Swarm Protocol v2
 
-**Status:** Initial design specification  
-**Protocol family:** Zapdrop local transfer  
-**Version:** `2`  
-**Transport status:** Wire model and validation foundation; encrypted transport implementation follows in the next Phase 6 slice
+**Status:** Initial design specification with Phase 6 secure-channel foundation
+**Protocol family:** Zapdrop local transfer
+**Version:** `2`
+**Transport status:** Wire models plus authenticated application-channel foundation; production listener migration and packet-capture qualification remain pending
 
 ## 1. Purpose and scope
 
@@ -11,7 +11,7 @@ Swarm Protocol v2 changes Zapdrop’s transfer abstraction from an isolated send
 
 The protocol is designed for private local-area networks. It does not require internet access, cloud storage, a central rendezvous service, SMB shares, mapped drives, domain credentials, or public DHT participation. Local discovery is only an untrusted hint. A device must be paired and trusted before it may receive a job capability or any file metadata.
 
-This document defines the versioned application objects and state machine. It does not claim that the current raw TCP implementation already encrypts payloads. Phase 6 will add TLS 1.3 or an equivalent reviewed secure channel around these objects before v2 is enabled for production transfers.
+This document defines the versioned application objects and state machine. The Phase 6 foundation now includes an authenticated application channel profile: Ed25519-signed ephemeral X25519 handshakes, HKDF-SHA256 directional keys, ChaCha20-Poly1305 frame protection, per-job key envelopes, and snapshot-bound authenticated associated data. The active v1 transfer path still uses its existing protocol; v2 production migration remains gated on integration and physical-LAN qualification.
 
 ## 2. Security model
 
@@ -134,9 +134,19 @@ A piece descriptor identifies the plaintext content before encryption.
 
 The associated authenticated data MUST bind at least `jobId`, `snapshotRoot`, `pieceId`, `objectId`, `index`, `offset`, and `plaintextLength`. A receiver MUST verify the ciphertext digest and AEAD tag before writing plaintext bytes to staging storage.
 
-## 5. Capability and control objects
+## 5. Secure-channel profile
 
-### 5.1 `RecipientCapability`
+The initial v2 secure-channel profile uses the following sequence. Each endpoint creates a fresh X25519 ephemeral keypair and an Ed25519-signed `SecureHandshake`. The signature covers the session ID, device ID, public-key fingerprint, ephemeral public key, handshake nonce, version, and timestamp. The receiver verifies the signature with the already trusted Ed25519 public key and compares the device ID and fingerprint against the trusted-peer record. A mismatch fails the session before any job metadata is accepted.
+
+Both endpoints compute the X25519 shared secret and a deterministic transcript hash over the two unsigned handshakes in device-ID order. HKDF-SHA256 derives separate initiator-to-responder and responder-to-initiator 256-bit keys. Each direction uses a monotonically increasing 64-bit sequence number with a deterministic 96-bit nonce. A receiver accepts only the next expected sequence number, so replayed and out-of-order frames fail closed. ChaCha20-Poly1305 authenticates the frame ciphertext and binds the sequence number and caller-supplied control AAD.
+
+A fresh 256-bit job key is generated per swarm job. The sender provisions it to each authorized recipient by encrypting it under the established directional channel key. The job-key envelope binds the job ID, snapshot root, key ID, and exact recipient ID as authenticated associated data. The content key itself is never serialized as plaintext. Encrypted piece headers bind the job, snapshot root, piece, object, index, offset, and plaintext length as authenticated associated data; ciphertext length and ciphertext SHA-256 are checked before decryption and staging writes.
+
+This application channel is an implementation foundation and is not yet a complete TLS 1.3 deployment. The next security slice must review the construction, integrate it with the real TCP listener, add secure-channel negotiation and rekeying policy, and validate the result with packet capture and physical-LAN tests before the v2 path is enabled by default.
+
+## 6. Capability and control objects
+
+### 6.1 `RecipientCapability`
 
 A capability authorizes one trusted device for a narrow operation.
 
@@ -155,7 +165,7 @@ A capability authorizes one trusted device for a narrow operation.
 
 `forwardPiece` is not present in direct mode. It is granted only to a selected relay peer in tree or mesh mode and MUST include an authorized child set, maximum bytes, and forwarding expiry in the extension fields.
 
-### 5.2 `SwarmFrame`
+### 6.2 `SwarmFrame`
 
 The initial v2 control frame kinds are:
 
@@ -179,7 +189,7 @@ The initial v2 control frame kinds are:
 
 Unknown mandatory frame kinds MUST fail the session. Unknown extension fields MAY be ignored only when the enclosing object remains valid and the extension is not security-critical.
 
-## 6. State machine
+## 7. State machine
 
 ```text
 DISCOVERED
@@ -211,7 +221,7 @@ COMPLETED
 
 No receiver writes a final destination while in `OFFERED`. Staging allocation is permitted only after authorization and destination validation. A receiver may reject a job because of user policy, disk space, conflicts, expired capability, unsupported profile, or security failure. Error codes must be stable enough for the UI and history layer to distinguish retryable network failures from permanent content or authorization failures.
 
-## 7. Chunk profile v2 initial values
+## 8. Chunk profile v2 initial values
 
 The initial profile is deliberately conservative and measurable. It is not a promise that these values are optimal for every filesystem or LAN.
 
@@ -223,24 +233,24 @@ The initial profile is deliberately conservative and measurable. It is not a pro
 | `maxRecipients` | 256 | Job authorization limit |
 | `maxActiveDirectPeers` | 8 | Existing application resource ceiling |
 | `hash` | SHA-256 | Must cover plaintext piece and final object |
-| `aead` | Reserved for Phase 6 secure-channel implementation | No unauthenticated encryption mode |
+| `aead` | `ChaCha20-Poly1305` for the application-channel foundation | No unauthenticated encryption mode |
 
-## 8. Compatibility and migration
+## 9. Compatibility and migration
 
 The current Phase 5 transfer protocol remains version `1` and must continue to operate while v2 is developed behind a feature boundary. A v1 peer must not be silently upgraded into a v2 swarm session. The hello negotiation must identify supported protocol versions and secure-channel profiles before a job descriptor is accepted.
 
 A v2 implementation may use the existing signed device identity and trusted-peer persistence. It must not reinterpret a v1 transfer ID as a v2 job ID without an explicit migration adapter. History records should preserve the protocol version, distribution mode, snapshot root, and child-recipient outcomes.
 
-## 9. Phase 6 implementation slices
+## 10. Phase 6 implementation slices
 
 The first implementation slice adds Rust serialization models, bounded validation, canonical identifier helpers, and unit tests. It does not change the active v1 transfer engine.
 
-The next slice adds a secure channel, derives or provisions a fresh job content key, binds the capability and snapshot root into authenticated data, and adds a feature-gated v2 loopback exchange. Only after that exchange passes should the sender and receiver runtime be migrated from v1 transfer frames to v2 direct mode.
+The secure-channel foundation adds signed ephemeral handshakes, directional key derivation, fresh job-key provisioning, snapshot-bound authenticated data, replay protection, and AEAD tests. The next slice must integrate it with the real TCP listener and add a feature-gated v2 loopback exchange. Only after that exchange passes should the sender and receiver runtime be migrated from v1 transfer frames to v2 direct mode.
 
 Tree/mesh forwarding, RaptorQ repair, privacy relays, and adaptive congestion-control selection are later protocol extensions. They must not be enabled by default until direct v2 transfer, large-file resume, revocation, and physical-LAN tests are complete.
 
-## 10. Acceptance criteria
+## 11. Acceptance criteria
 
-The initial protocol foundation is complete when all model types round-trip through JSON, invalid versions and kinds fail, duplicate recipients and malformed identifiers fail, capabilities cannot exceed job expiry, piece lengths and offsets are bounded, canonical snapshot objects reject duplicate children and unsafe paths, and v1 tests remain green.
+The initial protocol foundation is complete when all model types round-trip through JSON, invalid versions and kinds fail, duplicate recipients and malformed identifiers fail, capabilities cannot exceed job expiry, piece lengths and offsets are bounded, canonical snapshot objects reject duplicate children and unsafe paths, and v1 tests remain green. The secure-channel foundation additionally requires valid signed handshakes, trusted identity matching, directional key agreement, replay rejection, AAD tamper rejection, job-key envelope binding, and encrypted-piece snapshot binding; these tests are now implemented in `src-tauri/src/secure.rs`.
 
 The secure-channel milestone is complete when a packet capture contains no readable payload, the receiver rejects a changed sender key, replayed capabilities fail, rejected or expired jobs write no file, a valid encrypted piece can be verified independently, and the v2 loopback test can transfer one file in each direction concurrently.

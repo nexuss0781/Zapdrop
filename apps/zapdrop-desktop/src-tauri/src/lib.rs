@@ -4,6 +4,7 @@ mod history;
 mod identity;
 mod network;
 mod pairing;
+pub mod secure;
 mod settings;
 pub mod swarm;
 mod transfer;
