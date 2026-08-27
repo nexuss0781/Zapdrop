@@ -48,43 +48,49 @@ Add a repeatable operator script and evidence template for two, four, and eight 
 
 **Exit evidence:** Qualification package is committed and documented. Real hardware results are only marked complete after they are actually supplied or executed.
 
-### Phase 4 — Direct-transfer security closure slice
+### Phase 4 — v2 channel lifetime boundaries
 
-Address one security closure item at a time, beginning with explicit v2 session rekey/lifetime behavior and tests. Keep v1 default and preserve exact trust binding and receive approval. Do not market the result as TLS 1.3 or certified security.
+**State:** Complete as a bounded lifetime-enforcement slice; re-handshake/rekey orchestration remains open.
 
-**Exit evidence:** A narrowly scoped security change has tests, threat-model notes, and independent-review status recorded.
+Use one explicit accounting predicate for v2 send and receive channels. Refuse frames before sequence or byte-counter advancement when the `2^32` frame ceiling or `2^40` plaintext ceiling would be exceeded. Keep v1 default and preserve exact trust binding and receive approval. Do not market the result as TLS 1.3 or certified security.
 
-### Phase 5 — Protocol robustness and dependency gate
+**Exit evidence:** Exact-boundary, over-budget, send-side, and receive-side fail-closed tests pass in default and `swarm-v2` builds. See `docs/ZAPDROP_PHASE4_SECURITY_HARDENING.md`.
+
+### Phase 5 — Direct-transfer security closure slice
+
+Implement explicit v2 re-handshake/rekey orchestration as a separate phase, followed by independent review. Keep rekey traffic authenticated, job-scoped, bounded, and fail-closed; do not enable v2 by default.
+
+### Phase 6 — Protocol robustness and dependency gate
 
 Add malformed-input/fuzz targets or bounded property tests for discovery, pairing, manifests, secure frames, snapshot metadata, and journals; run dependency auditing; and record packet-capture expectations for the v1 and experimental v2 paths.
 
 **Exit evidence:** Reproducible robustness commands and their results are checked in, with unresolved findings listed rather than hidden.
 
-### Phase 6 — Phase 7 large-dataset acceptance
+### Phase 7 — Phase 7 large-dataset acceptance
 
 Stress snapshot indexing, subtree reuse, sparse resume, source mutation, disk-full behavior, Unicode paths, and large files using controlled local fixtures. Separate memory/CPU measurements from functional pass/fail claims.
 
 **Exit evidence:** Automated large-dataset report and remaining 4 GiB-plus physical-file requirements are documented.
 
-### Phase 7 — Phase 9 direct-only topology integration
+### Phase 8 — Phase 9 direct-only topology integration
 
 Only after the direct path and authorization gates are stable, implement the least-privilege tree/mesh data plane behind an explicit feature flag. Enforce signed job scope, relay consent, object allow-lists, byte budgets, expiry, revocation, and direct fallback. Do not enable arbitrary forwarding.
 
 **Exit evidence:** Multi-process tests demonstrate that unauthorized relays cannot receive or forward unrelated content, and direct fallback remains functional.
 
-### Phase 8 — Phase 10 repair integration
+### Phase 9 — Phase 10 repair integration
 
 Evaluate repair coding against measured loss conditions, then integrate only a bounded encrypted repair path if it improves completion time or source amplification without unacceptable CPU/memory cost. Keep systematic direct transfer as the reference path.
 
 **Exit evidence:** Loss-injection benchmark, resource measurements, protocol tests, and an explicit decision to enable or defer repair.
 
-### Phase 9 — Phase 11 companion runtime boundary
+### Phase 10 — Phase 11 companion runtime boundary
 
 Implement the companion’s authenticated pairing, receive approval, send/receive operations, snapshot/piece/journal compatibility, and version negotiation only for platforms that can be built and tested honestly. If legacy Windows runtime support cannot be qualified, publish a clear supported-platform boundary instead of claiming compatibility.
 
 **Exit evidence:** Modern desktop and companion exchange content in a reproducible test, or the unsupported-platform boundary is documented and enforced.
 
-### Phase 10 — Final Windows release and physical qualification
+### Phase 11 — Final Windows release and physical qualification
 
 Run the full automated gate, build Windows artifacts, perform the physical-LAN matrix, record privacy and firewall behavior, publish compatibility and known limitations, and package only artifacts whose signing and runtime status are explicit.
 
@@ -92,4 +98,4 @@ Run the full automated gate, build Windows artifacts, perform the physical-LAN m
 
 ## Immediate next move
 
-The next implementation action is **Phase 2 only**: build the local multi-recipient acceptance harness. No Phase 9, Phase 10, Phase 11, or final-release work will be started in the same phase. After Phase 2 passes, the change will be committed and pushed before Phase 3 begins.
+Phase 4 is complete in this revision. The next implementation action is **Phase 5 only**: implement explicit v2 re-handshake/rekey orchestration. No protocol fuzzing, tree/mesh, repair, companion, or release work will be started in the same phase. Phase 5 must be tested, documented, committed, and pushed before Phase 6 begins.

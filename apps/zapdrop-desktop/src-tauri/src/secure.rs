@@ -297,8 +297,7 @@ impl SecureChannel {
     pub fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<EncryptedFrame, SecureError> {
         let sequence = self.next_send_sequence;
         if sequence >= MAX_CHANNEL_FRAMES
-            || self.sent_plaintext_bytes
-                > MAX_CHANNEL_PLAINTEXT_BYTES.saturating_sub(plaintext.len() as u64)
+            || !plaintext_within_limit(self.sent_plaintext_bytes, plaintext.len() as u64)
         {
             return Err(SecureError::SequenceExhausted);
         }
@@ -361,9 +360,7 @@ impl SecureChannel {
                 tag,
             )
             .map_err(|_| SecureError::AuthenticationFailed)?;
-        if self.received_plaintext_bytes
-            > MAX_CHANNEL_PLAINTEXT_BYTES.saturating_sub(plaintext.len() as u64)
-        {
+        if !plaintext_within_limit(self.received_plaintext_bytes, plaintext.len() as u64) {
             return Err(SecureError::SequenceExhausted);
         }
         self.next_receive_sequence += 1;
@@ -637,6 +634,10 @@ impl SecretKey {
     }
 }
 
+fn plaintext_within_limit(used: u64, next: u64) -> bool {
+    next <= MAX_CHANNEL_PLAINTEXT_BYTES && used <= MAX_CHANNEL_PLAINTEXT_BYTES.saturating_sub(next)
+}
+
 fn sequence_nonce(sequence: u64) -> [u8; 12] {
     let mut nonce = [0u8; 12];
     nonce[4..].copy_from_slice(&sequence.to_be_bytes());
@@ -788,6 +789,55 @@ mod tests {
         assert!(matches!(
             bob.open(&frame, b"job-1"),
             Err(SecureError::ReplayOrOutOfOrder)
+        ));
+    }
+
+    #[test]
+    fn channel_lifetime_limits_fail_closed_at_exact_boundaries() {
+        assert!(plaintext_within_limit(MAX_CHANNEL_PLAINTEXT_BYTES - 1, 1));
+        assert!(!plaintext_within_limit(MAX_CHANNEL_PLAINTEXT_BYTES, 1));
+        assert!(!plaintext_within_limit(0, MAX_CHANNEL_PLAINTEXT_BYTES + 1));
+
+        let mut channel = SecureChannel {
+            send_key: SecretKey::new([7u8; 32]),
+            receive_key: SecretKey::new([8u8; 32]),
+            next_send_sequence: MAX_CHANNEL_FRAMES,
+            next_receive_sequence: 0,
+            sent_plaintext_bytes: 0,
+            received_plaintext_bytes: 0,
+        };
+        assert!(matches!(
+            channel.seal(b"payload", b"lifetime"),
+            Err(SecureError::SequenceExhausted)
+        ));
+
+        channel.next_send_sequence = 0;
+        channel.sent_plaintext_bytes = MAX_CHANNEL_PLAINTEXT_BYTES;
+        assert!(matches!(
+            channel.seal(b"payload", b"lifetime"),
+            Err(SecureError::SequenceExhausted)
+        ));
+
+        let mut sender = SecureChannel {
+            send_key: SecretKey::new([9u8; 32]),
+            receive_key: SecretKey::new([8u8; 32]),
+            next_send_sequence: 0,
+            next_receive_sequence: 0,
+            sent_plaintext_bytes: 0,
+            received_plaintext_bytes: 0,
+        };
+        let mut receiver = SecureChannel {
+            send_key: SecretKey::new([8u8; 32]),
+            receive_key: SecretKey::new([9u8; 32]),
+            next_send_sequence: 0,
+            next_receive_sequence: 0,
+            sent_plaintext_bytes: 0,
+            received_plaintext_bytes: MAX_CHANNEL_PLAINTEXT_BYTES,
+        };
+        let frame = sender.seal(b"payload", b"lifetime").unwrap();
+        assert!(matches!(
+            receiver.open(&frame, b"lifetime"),
+            Err(SecureError::SequenceExhausted)
         ));
     }
 
