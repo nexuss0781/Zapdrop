@@ -82,29 +82,37 @@ The experimental v2 direct path sends one encrypted, job-bound snapshot metadata
 
 **Exit evidence:** Existing v2 direct roundtrip passes with the new frame ordering, metadata mismatch tests pass, and the full qualification harness passes. See `docs/ZAPDROP_PHASE8_NETWORK_METADATA.md`.
 
-### Phase 9 — Interruption and resume integration acceptance
+### Phase 9 — Persisted sparse-resume loopback acceptance
 
-Implement or qualify multi-page metadata transport, durable sparse writes across process termination, subtree reuse across independent network snapshots, and explicit source-mutation revisions. Keep the 4 GiB-plus physical-file requirement as a separately recorded hardware gate.
+**State:** Complete in this revision; process-termination and physical-PC gates remain open.
 
-### Phase 10 — Phase 9 direct-only topology integration
+The experimental v2 direct path starts a fresh authenticated session against a pre-seeded partial file and journal, retains verified ranges, requests missing ranges through the encrypted ready frame, verifies the final digest, and records journal completion.
+
+**Exit evidence:** The real v2 loopback resume test passes, the snapshot qualification runner includes it, and the full qualification harness passes. See `docs/ZAPDROP_PHASE9_RESUME_ACCEPTANCE.md`.
+
+### Phase 10 — Follow-up interruption and snapshot integration
+
+Qualify multi-page metadata transport, durable sparse writes across process termination, subtree reuse across independent network snapshots, and explicit source-mutation revisions. Keep the 4 GiB-plus physical-file requirement as a separately recorded hardware gate.
+
+### Phase 11 — Phase 9 direct-only topology integration
 
 Only after the direct path and authorization gates are stable, implement the least-privilege tree/mesh data plane behind an explicit feature flag. Enforce signed job scope, relay consent, object allow-lists, byte budgets, expiry, revocation, and direct fallback. Do not enable arbitrary forwarding.
 
 **Exit evidence:** Multi-process tests demonstrate that unauthorized relays cannot receive or forward unrelated content, and direct fallback remains functional.
 
-### Phase 11 — Phase 10 repair integration
+### Phase 12 — Phase 10 repair integration
 
 Evaluate repair coding against measured loss conditions, then integrate only a bounded encrypted repair path if it improves completion time or source amplification without unacceptable CPU/memory cost. Keep systematic direct transfer as the reference path.
 
 **Exit evidence:** Loss-injection benchmark, resource measurements, protocol tests, and an explicit decision to enable or defer repair.
 
-### Phase 12 — Phase 11 companion runtime boundary
+### Phase 13 — Phase 11 companion runtime boundary
 
 Implement the companion’s authenticated pairing, receive approval, send/receive operations, snapshot/piece/journal compatibility, and version negotiation only for platforms that can be built and tested honestly. If legacy Windows runtime support cannot be qualified, publish a clear supported-platform boundary instead of claiming compatibility.
 
 **Exit evidence:** Modern desktop and companion exchange content in a reproducible test, or the unsupported-platform boundary is documented and enforced.
 
-### Phase 13 — Final Windows release and physical qualification
+### Phase 14 — Final Windows release and physical qualification
 
 Run the full automated gate, build Windows artifacts, perform the physical-LAN matrix, record privacy and firewall behavior, publish compatibility and known limitations, and package only artifacts whose signing and runtime status are explicit.
 
@@ -112,4 +120,4 @@ Run the full automated gate, build Windows artifacts, perform the physical-LAN m
 
 ## Immediate next move
 
-Phase 8 is complete in this revision. The next implementation action is **Phase 9 only**: qualify interruption and resume integration. No tree/mesh, repair, companion, or release work will be started in the same phase. Phase 9 must be tested, documented, committed, and pushed before the next phase begins.
+Phase 9 is complete in this revision. The next implementation action is **Phase 10 only**: qualify follow-up interruption and snapshot integration work. No tree/mesh, repair, companion, or release work will be started in the same phase. Phase 10 must be tested, documented, committed, and pushed before the next phase begins.

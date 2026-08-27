@@ -3740,6 +3740,165 @@ mod tests {
 
     #[cfg(feature = "swarm-v2")]
     #[test]
+    fn secure_v2_direct_file_transfer_resumes_from_persisted_sparse_journal() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-direct-v2-resume-{}", uuid::Uuid::new_v4()));
+        let server_data = root.join("server-data");
+        let client_data = root.join("client-data");
+        let source = root.join("large-source.bin");
+        let received = root.join("received");
+        fs::create_dir_all(&root).unwrap();
+        let total_size = 2 * crate::swarm::DEFAULT_PIECE_SIZE + 123;
+        let source_bytes = vec![0x5au8; total_size as usize];
+        fs::write(&source, &source_bytes).unwrap();
+        let server_store = SettingsStore::new(server_data);
+        let client_store = SettingsStore::new(client_data);
+        let server_identity = DeviceIdentity::load_or_create(&server_store).unwrap();
+        let client_identity = DeviceIdentity::load_or_create(&client_store).unwrap();
+        let server_trust = TrustedPeerStore::load(&server_store).unwrap();
+        server_trust
+            .upsert(TrustedPeer {
+                version: 1,
+                peer_id: client_identity.device_id.clone(),
+                name: "Resume Client".to_string(),
+                public_key: client_identity.public_key.clone(),
+                fingerprint: client_identity.fingerprint.clone(),
+                first_seen: 1,
+                last_seen: 1,
+                endpoint: "127.0.0.1:0".to_string(),
+            })
+            .unwrap();
+        let signing_key = client_identity.signing_key(&client_store).unwrap();
+        let profile = ChunkProfile {
+            profile_id: "fixed-4m-sha256-aead".to_string(),
+            piece_size: crate::swarm::DEFAULT_PIECE_SIZE,
+            max_in_flight_pieces: 8,
+            hash: "sha256".to_string(),
+            aead: "x25519-hkdf-sha256-chacha20poly1305".to_string(),
+        };
+        let manifest = build_v2_manifest(
+            &[TransferSource {
+                path: source.to_string_lossy().to_string(),
+                relative_path: Some("large-source.bin".to_string()),
+            }],
+            &profile,
+        )
+        .unwrap();
+        let item = manifest.first().unwrap();
+        let (job, _) = create_v2_job(
+            &client_identity,
+            "secure-v2-resume",
+            &server_identity.device_id,
+            &manifest,
+            &signing_key,
+        )
+        .unwrap();
+        fs::create_dir_all(&received).unwrap();
+        let partial = v2_partial_path(&received, &job.job_id, &item.item_id).unwrap();
+        let first_piece = profile.piece_size as usize;
+        fs::write(&partial, &source_bytes[..first_piece]).unwrap();
+        let mut journal =
+            crate::snapshot::TransferJournal::new(job.job_id.clone(), job.snapshot_root.clone());
+        journal
+            .mark_verified(
+                &item.item_id,
+                &item.sha256,
+                &item.relative_path,
+                crate::snapshot::ByteRange {
+                    offset: 0,
+                    length: profile.piece_size,
+                },
+            )
+            .unwrap();
+        let journal_file = crate::snapshot::journal_path(&received, &job.job_id);
+        journal.save_atomic(&journal_file).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let mut context = test_context(
+            server_identity.clone(),
+            server_store.clone(),
+            server_trust,
+            received.clone(),
+            "Resume Server",
+        );
+        context.always_ask_before_receive = true;
+        let approval_offers = context.offers.clone();
+        let approval_context = context.clone();
+        let server = thread::spawn(move || {
+            let (stream, address) = listener.accept().unwrap();
+            let first: serde_json::Value = read_json_line(&stream).unwrap();
+            assert!(is_secure_hello(&first));
+            let _ = address;
+            handle_secure_incoming(stream, first, context);
+        });
+        let peer = PeerRecord {
+            id: server_identity.device_id.clone(),
+            name: "Resume Server".to_string(),
+            platform: "windows".to_string(),
+            fingerprint: Some(server_identity.fingerprint.clone()),
+            public_key: Some(server_identity.public_key.clone()),
+            endpoint: endpoint.to_string(),
+            port: endpoint.port(),
+            status: "trusted".to_string(),
+            discovered_via: "secure-v2-resume-test".to_string(),
+            last_seen: epoch_seconds(),
+            trusted: true,
+        };
+        let sender = thread::spawn({
+            let client_identity = client_identity.clone();
+            let client_store = client_store.clone();
+            let peer = peer.clone();
+            let source = source.clone();
+            move || {
+                send_v2_direct(
+                    None,
+                    None,
+                    None,
+                    &client_identity,
+                    &client_store,
+                    "Resume Client",
+                    &peer,
+                    &[TransferSource {
+                        path: source.to_string_lossy().to_string(),
+                        relative_path: Some("large-source.bin".to_string()),
+                    }],
+                    "rename",
+                    "secure-v2-resume",
+                )
+            }
+        });
+        for _ in 0..50 {
+            if approval_offers
+                .list(&received.to_string_lossy())
+                .iter()
+                .any(|offer| offer.transfer_id == "secure-v2-resume")
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        approval_offers
+            .accept(
+                "secure-v2-resume",
+                "rename".to_string(),
+                None,
+                approval_context,
+            )
+            .unwrap();
+        sender.join().unwrap().unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            fs::read(received.join("large-source.bin")).unwrap(),
+            source_bytes
+        );
+        let loaded = crate::snapshot::TransferJournal::load(&journal_file).unwrap();
+        assert!(loaded.items.iter().any(|entry| entry.complete));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "swarm-v2")]
+    #[test]
     fn secure_v2_offer_rejects_preapproval_key_envelope() {
         let root = std::env::temp_dir().join(format!("zapdrop-v2-offer-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
