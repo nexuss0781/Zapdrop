@@ -5,6 +5,7 @@ mod identity;
 mod network;
 mod pairing;
 mod settings;
+pub mod swarm;
 mod transfer;
 mod trust;
 
