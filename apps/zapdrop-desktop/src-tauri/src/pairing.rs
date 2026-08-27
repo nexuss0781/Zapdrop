@@ -1,4 +1,9 @@
-use crate::{identity::DeviceIdentity, settings::SettingsStore, trust::TrustedPeer};
+use crate::{
+    identity::DeviceIdentity,
+    settings::SettingsStore,
+    transfer::{self, TransferServerContext},
+    trust::TrustedPeer,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use rand_core::{OsRng, RngCore};
@@ -108,6 +113,7 @@ struct PendingPairing {
 #[derive(Clone)]
 struct PairingContext {
     app: AppHandle,
+    transfer: Option<TransferServerContext>,
 }
 
 pub struct PairingCoordinator {
@@ -118,14 +124,18 @@ pub struct PairingCoordinator {
 }
 
 impl PairingCoordinator {
-    pub fn start(listener: TcpListener, app: AppHandle) -> io::Result<Self> {
+    pub fn start(
+        listener: TcpListener,
+        app: AppHandle,
+        transfer: Option<TransferServerContext>,
+    ) -> io::Result<Self> {
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let worker_pending = Arc::clone(&pending);
         let worker_stop = Arc::clone(&stop);
-        let context = PairingContext { app };
+        let context = PairingContext { app, transfer };
         let worker = thread::Builder::new()
             .name("zapdrop-pairing-listener".to_string())
             .spawn(move || {
@@ -137,7 +147,19 @@ impl PairingCoordinator {
                             let pending = Arc::clone(&worker_pending);
                             let context = context.clone();
                             thread::spawn(move || {
-                                handle_incoming(stream, address, pending, context)
+                                let first: serde_json::Value = match read_json_line(&stream) {
+                                    Ok(value) => value,
+                                    Err(error) => { let _ = write_json_line(&stream, &serde_json::json!({"kind":"zapdrop_protocol_error","error":error.to_string()})); return; }
+                                };
+                                if transfer::is_transfer_hello(&first) {
+                                    if let Some(transfer) = context.transfer.clone() {
+                                        transfer::handle_incoming(stream, address, first, transfer);
+                                    } else {
+                                        let _ = write_json_line(&stream, &serde_json::json!({"kind":"zapdrop_transfer_error","status":"failed","reason":"transfer service is unavailable"}));
+                                    }
+                                } else {
+                                    handle_incoming(stream, address, first, pending, context);
+                                }
                             });
                         }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -285,10 +307,12 @@ pub fn request_pairing(
 fn handle_incoming(
     mut stream: TcpStream,
     address: SocketAddr,
+    first: serde_json::Value,
     pending: Arc<Mutex<HashMap<String, PendingPairing>>>,
     context: PairingContext,
 ) {
-    let request: PairingRequest = match read_json_line(&stream)
+    let request: PairingRequest = match serde_json::from_value(first)
+        .map_err(invalid_data)
         .and_then(|request| validate_request(&request).map(|()| request))
     {
         Ok(request) => request,
@@ -518,14 +542,14 @@ fn validate_timestamp(timestamp: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn write_json_line<T: Serialize>(stream: &TcpStream, value: &T) -> io::Result<()> {
+pub(crate) fn write_json_line<T: Serialize>(stream: &TcpStream, value: &T) -> io::Result<()> {
     let mut writer = stream.try_clone()?;
     let mut bytes = serde_json::to_vec(value).map_err(invalid_data)?;
     bytes.push(b'\n');
     writer.write_all(&bytes)
 }
 
-fn read_json_line<T: for<'de> Deserialize<'de>>(stream: &TcpStream) -> io::Result<T> {
+pub(crate) fn read_json_line<T: for<'de> Deserialize<'de>>(stream: &TcpStream) -> io::Result<T> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = Vec::new();
     reader.read_until(b'\n', &mut line)?;

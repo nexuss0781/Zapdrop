@@ -3,6 +3,7 @@ mod identity;
 mod network;
 mod pairing;
 mod settings;
+mod transfer;
 mod trust;
 
 use discovery::{manual_peer, NetworkDiagnostics, PeerRecord};
@@ -11,6 +12,7 @@ use pairing::{PairingOutcome, PairingRequestView};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
+use transfer::TransferRequest;
 use trust::TrustedPeer;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -278,6 +280,33 @@ fn reject_pairing(
 }
 
 #[tauri::command]
+fn start_transfer(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    request: TransferRequest,
+) -> Result<String, String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    let transfer_id = runtime
+        .start_transfer(&app, request)
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("transfer-started", transfer_id.clone());
+    Ok(transfer_id)
+}
+
+#[tauri::command]
+fn cancel_transfer(state: tauri::State<'_, AppState>, transfer_id: String) -> Result<(), String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    runtime.cancel_transfer(&transfer_id);
+    Ok(())
+}
+
+#[tauri::command]
 fn revoke_trusted_peer(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -301,7 +330,7 @@ fn app_info(runtime: &RuntimeState) -> AppInfo {
     AppInfo {
         name: "Zapdrop",
         version: APP_VERSION,
-        phase: "Authenticated pairing",
+        phase: "Parallel local transfers",
         platform: std::env::consts::OS,
         local_only: true,
         device_id: runtime.identity.device_id.clone(),
@@ -339,6 +368,8 @@ pub fn run() {
             pair_with_peer,
             accept_pairing,
             reject_pairing,
+            start_transfer,
+            cancel_transfer,
             revoke_trusted_peer
         ])
         .run(tauri::generate_context!())

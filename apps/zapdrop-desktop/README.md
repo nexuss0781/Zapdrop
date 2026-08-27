@@ -68,6 +68,23 @@ pnpm desktop:build
 
 The Tauri Windows development prerequisites include Rust, Microsoft C++ Build Tools, and WebView2. Linux development additionally requires the WebKitGTK and GTK development libraries described by the Tauri documentation.
 
+## Phase 4 status
+
+Phase 4 is complete. The transfer engine uses a bounded framed TCP protocol on the existing authenticated local listener. The sender transmits a signed transfer hello, waits for the receiver’s hello acknowledgement, sends a validated manifest, receives resumable offsets, and streams checksummed chunks. The receiver re-checks the sender’s exact peer ID, public key, and fingerprint against `trusted-peers.json` at connection time before accepting the manifest.
+
+Transfer sources may be regular files or recursively enumerated directories. Symbolic links, absolute paths, parent traversal, duplicate manifest IDs/paths, reserved `.zapdrop-partial` paths, unsupported item types, and manifest size mismatches are rejected. Partial chunks are written under a private transfer state directory and renamed into the configured receive directory only after the final SHA-256 digest matches the manifest. Relative paths are resolved beneath the canonical receive root.
+
+The receiver supports `rename`, `overwrite`, and `skip` conflict policies. Partial item IDs are deterministic by relative path so a retry with the same transfer ID can resume an interrupted item. Sender sessions run independently for each recipient and are bounded to eight simultaneous recipients. Progress, completion, failure, and cancellation events are emitted per recipient. Cancellation is shared across the transfer’s workers and cleaned after the final worker exits.
+
+The dashboard now accepts an explicit local source path, starts transfers only for selected trusted peers, displays per-recipient progress bars and current paths, and exposes cancellation. Native file browsing remains a later UI enhancement; the transfer engine itself already supports files and folders.
+
+## Transfer commands
+
+| Command | Purpose |
+|---|---|
+| `start_transfer` | Validates sources and trusted recipients, then starts independent parallel sessions. |
+| `cancel_transfer` | Requests cancellation for all active recipient workers sharing a transfer ID. |
+
 ## Next phase
 
-Phase 4 is ready to begin. It should implement the receiver-side HTTP or framed streaming transfer service only for trusted peers, safe destination resolution, conflict policies, progress events, cancellation, and resumable chunk state. The service must re-check trust at connection time rather than relying on a stale UI state.
+Phase 5 is ready to begin. It should add native filesystem browsing and file/folder selection, transfer history persistence, richer receive notifications, installer-level firewall guidance, two-machine acceptance automation, and performance tuning for large directories and high-throughput local networks. The trust check and safe destination resolver must remain in the receive path.

@@ -3,6 +3,7 @@ use crate::{
     identity::DeviceIdentity,
     pairing::{PairingCoordinator, PairingOutcome, PairingRequestView},
     settings::{default_data_dir, AppSettings, SettingsStore},
+    transfer::{TransferManager, TransferRequest, TransferServerContext},
     trust::{TrustedPeer, TrustedPeerStore},
 };
 use std::{collections::HashMap, io};
@@ -15,6 +16,7 @@ pub struct RuntimeState {
     pub discovery: Option<DiscoveryService>,
     pub pairing: Option<PairingCoordinator>,
     pub trust: TrustedPeerStore,
+    pub transfer: TransferManager,
     pub discovery_error: Option<String>,
     pub pairing_error: Option<String>,
     pub manual_peers: HashMap<String, PeerRecord>,
@@ -33,6 +35,7 @@ impl RuntimeState {
             discovery: None,
             pairing: None,
             trust,
+            transfer: TransferManager::new(),
             discovery_error: None,
             pairing_error: None,
             manual_peers: HashMap::new(),
@@ -59,9 +62,13 @@ impl RuntimeState {
             &self.identity.public_key,
         ) {
             Ok(service) => {
-                let pairing = service
-                    .pairing_listener()
-                    .and_then(|listener| PairingCoordinator::start(listener, app.clone()));
+                let pairing = service.pairing_listener().and_then(|listener| {
+                    PairingCoordinator::start(
+                        listener,
+                        app.clone(),
+                        Some(self.transfer_context(app)),
+                    )
+                });
                 match pairing {
                     Ok(pairing) => self.pairing = Some(pairing),
                     Err(error) => self.pairing_error = Some(error.to_string()),
@@ -75,6 +82,33 @@ impl RuntimeState {
                     Some("Pairing listener unavailable without a local endpoint".to_string());
             }
         }
+    }
+
+    pub fn transfer_context(&self, app: &AppHandle) -> TransferServerContext {
+        TransferServerContext {
+            app: app.clone(),
+            identity: self.identity.clone(),
+            store: self.store.clone(),
+            trust: self.trust.clone(),
+            device_name: self.settings.device_name.clone(),
+            receive_directory: self.settings.receive_directory.clone(),
+            cancelled: self.transfer.cancelled.clone(),
+        }
+    }
+
+    pub fn start_transfer(&self, app: &AppHandle, request: TransferRequest) -> io::Result<String> {
+        self.transfer.start_parallel(
+            app.clone(),
+            self.identity.clone(),
+            self.store.clone(),
+            self.settings.device_name.clone(),
+            self.peers(),
+            request,
+        )
+    }
+
+    pub fn cancel_transfer(&self, transfer_id: &str) {
+        self.transfer.cancel(transfer_id);
     }
 
     pub fn stop_pairing(&mut self) {
