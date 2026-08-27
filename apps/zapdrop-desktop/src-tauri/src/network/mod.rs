@@ -139,7 +139,11 @@ impl RuntimeState {
             peers.extend(discovery.registry.list());
         }
         for peer in &mut peers {
-            peer.trusted = self.trust.contains(&peer.id, peer.fingerprint.as_deref());
+            peer.trusted = self.trust.matches_exact(
+                &peer.id,
+                peer.public_key.as_deref(),
+                peer.fingerprint.as_deref(),
+            );
             if peer.trusted && peer.status == "online" {
                 peer.status = "trusted".to_string();
             }
@@ -205,10 +209,19 @@ impl RuntimeState {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "peer is no longer available")
             })?;
+        let trusted = self.trust.find_by_id(peer_id);
+        let expected_fingerprint = trusted
+            .as_ref()
+            .map(|peer| peer.fingerprint.as_str())
+            .or(peer.fingerprint.as_deref());
+        let expected_public_key = trusted
+            .as_ref()
+            .map(|peer| peer.public_key.as_str())
+            .or(peer.public_key.as_deref());
         let outcome = crate::pairing::request_pairing(
             &peer.endpoint,
-            peer.fingerprint.as_deref(),
-            peer.public_key.as_deref(),
+            expected_fingerprint,
+            expected_public_key,
             &self.identity,
             &self.store,
             &self.settings.device_name,

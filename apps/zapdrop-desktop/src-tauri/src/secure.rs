@@ -246,6 +246,9 @@ pub fn establish_channel(
     let transcript = transcript_hash(local_handshake, peer_handshake)?;
 
     let shared = local.secret.diffie_hellman(&peer_public);
+    if shared.as_bytes().iter().all(|byte| *byte == 0) {
+        return Err(SecureError::AuthenticationFailed);
+    }
     let hkdf = Hkdf::<Sha256>::new(Some(&transcript), shared.as_bytes());
     let mut initiator_to_responder = [0u8; 32];
     let mut responder_to_initiator = [0u8; 32];
@@ -448,6 +451,7 @@ pub fn open_job_key(
     }
     if envelope.job_id != job.job_id
         || envelope.snapshot_root != job.snapshot_root
+        || envelope.key_id != job.content_key_id
         || envelope.recipient_id != recipient_id
         || !job.authorizes(recipient_id)
     {
@@ -841,6 +845,20 @@ mod tests {
         let opened = open_job_key(&envelope, &job, "receiver-1", &channel_key).unwrap();
         assert_eq!(opened.as_bytes(), content_key.as_bytes());
         assert!(open_job_key(&envelope, &job, "wrong", &channel_key).is_err());
+    }
+
+    #[test]
+    fn job_key_envelope_rejects_wrong_content_key_id() {
+        let job = sample_job();
+        let content_key = JobKey::generate();
+        let channel_key = JobKey::generate();
+        let mut envelope =
+            provision_job_key(&job, "receiver-1", "key-1", &content_key, &channel_key).unwrap();
+        envelope.key_id = "other-key".to_string();
+        assert!(matches!(
+            open_job_key(&envelope, &job, "receiver-1", &channel_key),
+            Err(SecureError::AuthenticationFailed)
+        ));
     }
 
     #[test]

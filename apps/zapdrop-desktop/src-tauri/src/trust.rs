@@ -69,6 +69,38 @@ impl TrustedPeerStore {
         self.peers.lock().expect("trusted peers poisoned").clone()
     }
 
+    pub fn find_by_id(&self, peer_id: &str) -> Option<TrustedPeer> {
+        self.peers
+            .lock()
+            .expect("trusted peers poisoned")
+            .iter()
+            .find(|peer| peer.peer_id == peer_id)
+            .cloned()
+    }
+
+    pub fn matches_exact(
+        &self,
+        peer_id: &str,
+        public_key: Option<&str>,
+        fingerprint: Option<&str>,
+    ) -> bool {
+        let Some(public_key) = public_key else {
+            return false;
+        };
+        let Some(fingerprint) = fingerprint else {
+            return false;
+        };
+        self.peers
+            .lock()
+            .expect("trusted peers poisoned")
+            .iter()
+            .any(|peer| {
+                peer.peer_id == peer_id
+                    && peer.public_key == public_key
+                    && peer.fingerprint == fingerprint
+            })
+    }
+
     pub fn contains(&self, peer_id: &str, fingerprint: Option<&str>) -> bool {
         self.peers
             .lock()
@@ -76,7 +108,7 @@ impl TrustedPeerStore {
             .iter()
             .any(|peer| {
                 peer.peer_id == peer_id
-                    || fingerprint
+                    && fingerprint
                         .map(|value| value == peer.fingerprint)
                         .unwrap_or(false)
             })
@@ -84,14 +116,26 @@ impl TrustedPeerStore {
 
     pub fn upsert(&self, peer: TrustedPeer) -> io::Result<()> {
         let mut peers = self.peers.lock().expect("trusted peers poisoned");
-        if let Some(existing) = peers.iter_mut().find(|existing| {
-            existing.peer_id == peer.peer_id || existing.fingerprint == peer.fingerprint
-        }) {
+        if let Some(existing) = peers
+            .iter_mut()
+            .find(|existing| existing.peer_id == peer.peer_id)
+        {
+            if existing.public_key != peer.public_key || existing.fingerprint != peer.fingerprint {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "trusted peer key changed; revoke and pair again explicitly",
+                ));
+            }
             existing.name = peer.name;
-            existing.public_key = peer.public_key;
-            existing.fingerprint = peer.fingerprint;
             existing.last_seen = peer.last_seen;
             existing.endpoint = peer.endpoint;
+        } else if peers.iter().any(|existing| {
+            existing.fingerprint == peer.fingerprint || existing.public_key == peer.public_key
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "public key or fingerprint is already bound to another trusted peer",
+            ));
         } else {
             peers.push(peer);
         }
@@ -142,12 +186,14 @@ mod tests {
             .expect("save peer");
         let reloaded = TrustedPeerStore::load(&settings).expect("reload trust store");
         assert!(reloaded.contains("peer-1", Some("aa:bb")));
+        assert!(reloaded.matches_exact("peer-1", Some("public-key"), Some("aa:bb"),));
+        assert!(!reloaded.matches_exact("peer-1", Some("attacker-key"), Some("aa:bb"),));
         reloaded
             .upsert(TrustedPeer {
                 version: 1,
                 peer_id: "peer-1".into(),
                 name: "Studio PC".into(),
-                public_key: "new-key".into(),
+                public_key: "public-key".into(),
                 fingerprint: "aa:bb".into(),
                 first_seen: 1,
                 last_seen: 3,
@@ -155,6 +201,18 @@ mod tests {
             })
             .expect("update peer");
         assert_eq!(reloaded.list()[0].endpoint, "192.168.1.21:53317");
+        assert!(reloaded
+            .upsert(TrustedPeer {
+                version: 1,
+                peer_id: "peer-1".into(),
+                name: "Attacker".into(),
+                public_key: "new-key".into(),
+                fingerprint: "cc:dd".into(),
+                first_seen: 1,
+                last_seen: 4,
+                endpoint: "192.168.1.99:53317".into(),
+            })
+            .is_err());
         assert!(reloaded.remove("peer-1").expect("remove peer"));
         assert!(!reloaded.contains("peer-1", Some("aa:bb")));
         fs::remove_dir_all(root).expect("remove test data");

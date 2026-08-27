@@ -189,5 +189,5 @@ jobs:
       - name: Run simultaneous A-to-B and B-to-A transfer test
         run: cargo test --manifest-path "$TAURI_DIR/Cargo.toml" --lib transfer::tests::bidirectional_concurrent_loopback_transfer -- --nocapture
 
-      - name: Run feature-gated encrypted v2 direct-transfer test
-        run: cargo test --manifest-path "$TAURI_DIR/Cargo.toml" --features swarm-v2 --lib transfer::tests::secure_v2_direct_file_transfer_roundtrip -- --nocapture
+      - name: Run feature-gated encrypted v2 verification suite
+        run: cargo test --manifest-path "$TAURI_DIR/Cargo.toml" --features swarm-v2 --lib

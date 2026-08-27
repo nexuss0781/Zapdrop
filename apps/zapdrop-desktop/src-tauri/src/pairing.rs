@@ -14,7 +14,7 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
@@ -28,6 +28,8 @@ const REQUEST_KIND: &str = "zapdrop_pair_request";
 const RESPONSE_KIND: &str = "zapdrop_pair_response";
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const CLOCK_SKEW_SECONDS: u64 = 300;
+const MAX_ACTIVE_CONNECTIONS: usize = 64;
+const MAX_PENDING_PAIRINGS: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,6 +118,14 @@ struct PairingContext {
     transfer: Option<TransferServerContext>,
 }
 
+struct ActiveConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub struct PairingCoordinator {
     pending: Arc<Mutex<HashMap<String, PendingPairing>>>,
     stop: Arc<AtomicBool>,
@@ -134,6 +144,8 @@ impl PairingCoordinator {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let worker_pending = Arc::clone(&pending);
+        let worker_active = Arc::new(AtomicUsize::new(0));
+        let worker_active_count = Arc::clone(&worker_active);
         let worker_stop = Arc::clone(&stop);
         let context = PairingContext { app, transfer };
         let worker = thread::Builder::new()
@@ -142,11 +154,28 @@ impl PairingCoordinator {
                 while !worker_stop.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, address)) => {
+                            if worker_active_count
+                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                                    (count < MAX_ACTIVE_CONNECTIONS).then_some(count + 1)
+                                })
+                                .is_err()
+                            {
+                                let _ = write_json_line(
+                                    &stream,
+                                    &serde_json::json!({
+                                        "kind": "zapdrop_protocol_error",
+                                        "error": "too many active connections"
+                                    }),
+                                );
+                                continue;
+                            }
                             let _ = stream.set_read_timeout(Some(Duration::from_secs(12)));
                             let _ = stream.set_write_timeout(Some(Duration::from_secs(12)));
                             let pending = Arc::clone(&worker_pending);
+                            let active = Arc::clone(&worker_active_count);
                             let context = context.clone();
                             thread::spawn(move || {
+                                let _guard = ActiveConnectionGuard(active);
                                 let first: serde_json::Value = match read_json_line(&stream) {
                                     Ok(value) => value,
                                     Err(error) => { let _ = write_json_line(&stream, &serde_json::json!({"kind":"zapdrop_protocol_error","error":error.to_string()})); return; }
@@ -338,7 +367,14 @@ fn handle_incoming(
         endpoint: address.to_string(),
         received_at: request.timestamp,
     };
-    pending.lock().expect("pending pairings poisoned").insert(
+    let mut pending_guard = pending.lock().expect("pending pairings poisoned");
+    if pending_guard.len() >= MAX_PENDING_PAIRINGS
+        && !pending_guard.contains_key(&request.request_id)
+    {
+        let _ = stream.write_all(b"pairing error: too many pending pairing requests\n");
+        return;
+    }
+    pending_guard.insert(
         request.request_id.clone(),
         PendingPairing {
             request,
@@ -558,12 +594,29 @@ pub(crate) fn write_json_line<T: Serialize>(stream: &TcpStream, value: &T) -> io
 
 pub(crate) fn read_json_line<T: for<'de> Deserialize<'de>>(stream: &TcpStream) -> io::Result<T> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = Vec::new();
-    reader.read_until(b'\n', &mut line)?;
-    if line.len() > MAX_LINE_BYTES {
-        return Err(invalid_data("pairing frame too large"));
+    let mut line = Vec::with_capacity(MAX_LINE_BYTES.min(8 * 1024));
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "pairing frame ended before newline",
+                ));
+            }
+            return Err(invalid_data("pairing frame ended before newline"));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(consumed) > MAX_LINE_BYTES {
+            return Err(invalid_data("pairing frame too large"));
+        }
+        line.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return serde_json::from_slice(line.trim_ascii()).map_err(invalid_data);
+        }
     }
-    serde_json::from_slice(line.trim_ascii()).map_err(invalid_data)
 }
 
 fn invalid_data(error: impl ToString) -> io::Error {

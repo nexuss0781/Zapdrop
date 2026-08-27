@@ -46,6 +46,7 @@ const CHUNK_SIZE: usize = 1024 * 1024;
 const HELLO_ACCEPTED_KIND: &str = "zapdrop_transfer_hello_ok";
 const MAX_PARALLEL_RECIPIENTS: usize = 8;
 const OFFER_TIMEOUT_SECS: u64 = 120;
+const MAX_PENDING_TRANSFER_OFFERS: usize = 32;
 #[cfg(feature = "swarm-v2")]
 const V2_JOB_AAD: &[u8] = b"zapdrop/swarm/v2/direct-job";
 #[cfg(feature = "swarm-v2")]
@@ -62,6 +63,12 @@ const V2_DIRECT_READY_KIND: &str = "zapdrop_swarm_direct_ready";
 const V2_DIRECT_PIECE_KIND: &str = "zapdrop_swarm_direct_piece";
 #[cfg(feature = "swarm-v2")]
 const V2_DIRECT_COMPLETE_KIND: &str = "zapdrop_swarm_direct_complete";
+#[cfg(feature = "swarm-v2")]
+const MAX_V2_DIRECT_ITEMS: usize = 100_000;
+#[cfg(feature = "swarm-v2")]
+const MAX_V2_DIRECT_TOTAL_BYTES: u64 = 1 << 50;
+#[cfg(feature = "swarm-v2")]
+const MAX_V2_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[cfg(feature = "swarm-v2")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +206,14 @@ fn v2_epoch_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(feature = "swarm-v2")]
+fn v2_switch_enabled(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1" | "true" | "TRUE")
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,21 +419,37 @@ impl ReceiveOfferCoordinator {
             .retain(|_, offer| offer.received_at >= cutoff);
     }
 
-    fn insert(&self, offer: PendingTransferOffer) {
+    fn insert(&self, offer: PendingTransferOffer) -> io::Result<()> {
         self.purge_expired();
-        self.pending
+        let mut pending = self
+            .pending
             .lock()
-            .expect("pending transfer offers poisoned")
-            .insert(offer.manifest.transfer_id.clone(), offer);
+            .expect("pending transfer offers poisoned");
+        if pending.contains_key(&offer.manifest.transfer_id) {
+            return Err(invalid("duplicate transfer offer"));
+        }
+        if pending.len() >= MAX_PENDING_TRANSFER_OFFERS {
+            return Err(invalid("too many pending transfer offers"));
+        }
+        pending.insert(offer.manifest.transfer_id.clone(), offer);
+        Ok(())
     }
 
     #[cfg(feature = "swarm-v2")]
-    fn insert_v2(&self, offer: PendingV2TransferOffer) {
+    fn insert_v2(&self, offer: PendingV2TransferOffer) -> io::Result<()> {
         self.purge_expired();
-        self.pending_v2
+        let mut pending = self
+            .pending_v2
             .lock()
-            .expect("pending v2 transfer offers poisoned")
-            .insert(offer.offer.job.job_id.clone(), offer);
+            .expect("pending v2 transfer offers poisoned");
+        if pending.contains_key(&offer.offer.job.job_id) {
+            return Err(invalid("duplicate v2 transfer offer"));
+        }
+        if pending.len() >= MAX_PENDING_TRANSFER_OFFERS {
+            return Err(invalid("too many pending v2 transfer offers"));
+        }
+        pending.insert(offer.offer.job.job_id.clone(), offer);
+        Ok(())
     }
 
     pub fn accept(
@@ -554,7 +585,7 @@ impl ReceiveOfferCoordinator {
             reason: None,
         };
         let mut channel = pending.channel;
-        write_json_line(
+        write_v2_frame(
             &pending.stream,
             &seal_v2_json(&mut channel, &decision, V2_JOB_AAD)?,
         )?;
@@ -610,7 +641,7 @@ impl ReceiveOfferCoordinator {
                 conflict_policy: "rename".to_string(),
                 reason: Some(reason),
             };
-            return write_json_line(
+            return write_v2_frame(
                 &pending.stream,
                 &seal_v2_json(&mut channel, &decision, V2_JOB_AAD)?,
             );
@@ -958,7 +989,7 @@ pub fn handle_secure_incoming(
         Ok(clone) => BufReader::new(clone),
         Err(_) => return,
     };
-    let frame: EncryptedFrame = match read_json_line_from_reader(&mut reader) {
+    let frame: EncryptedFrame = match read_v2_frame(&mut reader) {
         Ok(value) => value,
         Err(_) => return,
     };
@@ -986,16 +1017,22 @@ pub fn handle_secure_incoming(
         conflicts: existing_v2_conflicts(&context.receive_directory, &offer),
         received_at,
     };
-    context.offers.insert_v2(PendingV2TransferOffer {
-        stream,
-        reader,
-        channel,
-        offer,
-        peer_id: trusted.peer_id.clone(),
-        peer_name: trusted.name.clone(),
-        peer_key,
-        received_at,
-    });
+    if context
+        .offers
+        .insert_v2(PendingV2TransferOffer {
+            stream,
+            reader,
+            channel,
+            offer,
+            peer_id: trusted.peer_id.clone(),
+            peer_name: trusted.name.clone(),
+            peer_key,
+            received_at,
+        })
+        .is_err()
+    {
+        return;
+    }
     if let Some(app) = context.app.as_ref() {
         let _ = app.emit("incoming-transfer-offer", incoming);
     }
@@ -1082,13 +1119,19 @@ pub fn handle_incoming(
         received_at,
     };
     let transfer_id = manifest.transfer_id.clone();
-    context.offers.insert(PendingTransferOffer {
-        stream,
-        manifest,
-        peer_id,
-        peer_name,
-        received_at,
-    });
+    if context
+        .offers
+        .insert(PendingTransferOffer {
+            stream,
+            manifest,
+            peer_id,
+            peer_name,
+            received_at,
+        })
+        .is_err()
+    {
+        return;
+    }
     if let Some(app) = context.app.as_ref() {
         let _ = app.emit("incoming-transfer-offer", offer);
     }
@@ -1145,8 +1188,7 @@ fn create_v2_job(
         hash: "sha256".to_string(),
         aead: "x25519-hkdf-sha256-chacha20poly1305".to_string(),
     };
-    let snapshot_bytes = serde_json::to_vec(items).map_err(invalid)?;
-    let snapshot_root = format!("sha256:{}", digest_bytes(&snapshot_bytes));
+    let snapshot_root = v2_snapshot_root(items)?;
     let mut job = SwarmJob {
         kind: "zapdrop_swarm_job".to_string(),
         version: SWARM_PROTOCOL_VERSION,
@@ -1233,8 +1275,8 @@ fn send_v2_direct(
         conflict_policy: policy.to_string(),
         key_envelope: None,
     };
-    write_json_line(&stream, &seal_v2_json(&mut channel, &offer, V2_JOB_AAD)?)?;
-    let decision_frame: EncryptedFrame = read_json_line_from_reader(&mut reader)?;
+    write_v2_frame(&stream, &seal_v2_json(&mut channel, &offer, V2_JOB_AAD)?)?;
+    let decision_frame: EncryptedFrame = read_v2_frame(&mut reader)?;
     let decision: V2DirectDecision = open_v2_json(&mut channel, &decision_frame, V2_JOB_AAD)?;
     if !decision.accepted || decision.job_id != job.job_id {
         return Err(invalid(
@@ -1252,11 +1294,11 @@ fn send_v2_direct(
         job_id: job.job_id.clone(),
         key_envelope,
     };
-    write_json_line(
+    write_v2_frame(
         &stream,
         &seal_v2_json(&mut channel, &key_provision, V2_JOB_AAD)?,
     )?;
-    let ready_frame: EncryptedFrame = read_json_line_from_reader(&mut reader)?;
+    let ready_frame: EncryptedFrame = read_v2_frame(&mut reader)?;
     let ready: V2DirectReady = open_v2_json(&mut channel, &ready_frame, V2_JOB_AAD)?;
     if ready.kind != V2_DIRECT_READY_KIND
         || ready.version != SWARM_PROTOCOL_VERSION
@@ -1304,9 +1346,9 @@ fn send_v2_direct(
                 kind: V2_DIRECT_PIECE_KIND.to_string(),
                 version: SWARM_PROTOCOL_VERSION,
                 header,
-                ciphertext: BASE64.encode(ciphertext),
+                ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
             };
-            write_json_line(&stream, &seal_v2_json(&mut channel, &piece, V2_PIECE_AAD)?)?;
+            write_v2_frame(&stream, &seal_v2_json(&mut channel, &piece, V2_PIECE_AAD)?)?;
             offset += read as u64;
             index += 1;
             sent_bytes += read as u64;
@@ -1326,7 +1368,7 @@ fn send_v2_direct(
             );
         }
     }
-    let completion_frame: EncryptedFrame = read_json_line_from_reader(&mut reader)?;
+    let completion_frame: EncryptedFrame = read_v2_frame(&mut reader)?;
     let completion: V2DirectCompletion =
         open_v2_json(&mut channel, &completion_frame, V2_COMPLETE_AAD)?;
     if completion.kind != V2_DIRECT_COMPLETE_KIND
@@ -1451,15 +1493,115 @@ fn validate_v2_direct_offer(
     if offer.job.sender_id != peer_id
         || offer.job.sender_public_key != URL_SAFE_NO_PAD.encode(peer_key.to_bytes())
         || offer.job.sender_fingerprint != fingerprint(&peer_key.to_bytes())
+        || offer.job.distribution_mode != DistributionMode::Direct
+        || offer.job.chunk_profile.profile_id != "fixed-4m-sha256-aead"
+        || offer.job.chunk_profile.piece_size != crate::swarm::DEFAULT_PIECE_SIZE
+        || offer.job.chunk_profile.aead != "x25519-hkdf-sha256-chacha20poly1305"
         || !offer.job.authorizes(&context.identity.device_id)
         || offer.items.is_empty()
-        || offer.items.len() > 100_000
+        || offer.items.len() > MAX_V2_DIRECT_ITEMS
+        || offer.total_bytes > MAX_V2_DIRECT_TOTAL_BYTES
         || offer.key_envelope.is_some()
-        || offer.items.iter().map(|item| item.size).sum::<u64>() != offer.total_bytes
     {
         return Err(invalid("v2 direct job authorization or manifest mismatch"));
     }
+    validate_v2_component("jobId", &offer.job.job_id)?;
+    if context.history.list().iter().any(|entry| {
+        entry.transfer_id == offer.job.job_id
+            && entry.peer_id == peer_id
+            && entry.status == "completed"
+    }) {
+        return Err(invalid("v2 job has already completed"));
+    }
+    normalize_conflict_policy(&offer.conflict_policy)?;
+    let mut item_ids = HashSet::with_capacity(offer.items.len());
+    let mut paths = HashSet::with_capacity(offer.items.len());
+    let total_bytes = offer.items.iter().try_fold(0u64, |total, item| {
+        validate_v2_component("itemId", &item.item_id)?;
+        validate_relative_path(&item.relative_path)?;
+        if item.kind != "file" {
+            return Err(invalid("v2 direct jobs support regular files only"));
+        }
+        if !item_ids.insert(item.item_id.as_str()) || !paths.insert(item.relative_path.as_str()) {
+            return Err(invalid(
+                "v2 direct manifest contains duplicate IDs or paths",
+            ));
+        }
+        if !is_sha256_hex(&item.sha256) {
+            return Err(invalid("v2 direct manifest contains an invalid digest"));
+        }
+        total
+            .checked_add(item.size)
+            .ok_or_else(|| invalid("v2 direct size overflow"))
+    })?;
+    if total_bytes != offer.total_bytes
+        || v2_snapshot_root(&offer.items)? != offer.job.snapshot_root
+    {
+        return Err(invalid("v2 direct snapshot root or total mismatch"));
+    }
     Ok(())
+}
+
+#[cfg(feature = "swarm-v2")]
+fn validate_v2_component(field: &str, value: &str) -> io::Result<()> {
+    if value.is_empty()
+        || value.len() > crate::swarm::MAX_SWARM_ID_BYTES
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.chars().any(|character| character.is_control())
+    {
+        return Err(invalid(format!("invalid v2 {field}")));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "swarm-v2")]
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(feature = "swarm-v2")]
+fn v2_snapshot_root(items: &[ManifestItem]) -> io::Result<String> {
+    let mut canonical = items.to_vec();
+    canonical.sort_by(|left, right| {
+        left.relative_path
+            .cmp(&right.relative_path)
+            .then_with(|| left.item_id.cmp(&right.item_id))
+    });
+    let bytes = serde_json::to_vec(&canonical).map_err(invalid)?;
+    Ok(format!("sha256:{}", digest_bytes(&bytes)))
+}
+
+#[cfg(feature = "swarm-v2")]
+fn v2_partial_path(root: &Path, job_id: &str, item_id: &str) -> io::Result<PathBuf> {
+    let partial_root = root.join(".zapdrop-partial");
+    reject_symlink(&partial_root)?;
+    fs::create_dir_all(&partial_root)?;
+    let job_root = partial_root.join(format!("job-{}", digest_bytes(job_id.as_bytes())));
+    reject_symlink(&job_root)?;
+    fs::create_dir_all(&job_root)?;
+    if !fs::canonicalize(&job_root)?.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "v2 partial directory escapes receive root",
+        ));
+    }
+    Ok(job_root.join(format!("item-{}.part", digest_bytes(item_id.as_bytes()))))
+}
+
+#[cfg(feature = "swarm-v2")]
+fn reject_symlink(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "symlinked transfer staging path is not allowed",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(feature = "swarm-v2")]
@@ -1487,9 +1629,9 @@ fn receive_v2_direct_inner(
             conflict_policy: policy.clone(),
             reason: None,
         };
-        write_json_line(stream, &seal_v2_json(channel, &decision, V2_JOB_AAD)?)?;
+        write_v2_frame(stream, &seal_v2_json(channel, &decision, V2_JOB_AAD)?)?;
     }
-    let key_frame: EncryptedFrame = read_json_line_from_reader(reader)?;
+    let key_frame: EncryptedFrame = read_v2_frame(reader)?;
     let key_provision: V2DirectKeyProvision = open_v2_json(channel, &key_frame, V2_JOB_AAD)?;
     if key_provision.kind != "zapdrop_swarm_direct_key"
         || key_provision.version != SWARM_PROTOCOL_VERSION
@@ -1507,7 +1649,8 @@ fn receive_v2_direct_inner(
     let mut offsets = HashMap::new();
     let mut total_done = 0u64;
     for item in &offer.items {
-        let partial = partial_path(&destination, &offer.job.job_id, item);
+        let partial = v2_partial_path(&destination, &offer.job.job_id, &item.item_id)?;
+        reject_symlink(&partial)?;
         let mut offset = fs::metadata(&partial)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
@@ -1524,10 +1667,11 @@ fn receive_v2_direct_inner(
         job_id: offer.job.job_id.clone(),
         offsets,
     };
-    write_json_line(stream, &seal_v2_json(channel, &ready, V2_JOB_AAD)?)?;
+    write_v2_frame(stream, &seal_v2_json(channel, &ready, V2_JOB_AAD)?)?;
     let mut completed = 0usize;
     for item in &offer.items {
-        let partial = partial_path(&destination, &offer.job.job_id, item);
+        let partial = v2_partial_path(&destination, &offer.job.job_id, &item.item_id)?;
+        reject_symlink(&partial)?;
         let mut offset = fs::metadata(&partial)
             .map(|metadata| metadata.len().min(item.size))
             .unwrap_or(0);
@@ -1544,7 +1688,7 @@ fn receive_v2_direct_inner(
                     "v2 transfer cancelled",
                 ));
             }
-            let frame: EncryptedFrame = read_json_line_from_reader(reader)?;
+            let frame: EncryptedFrame = read_v2_frame(reader)?;
             let piece: V2DirectPiece = open_v2_json(channel, &frame, V2_PIECE_AAD)?;
             if piece.kind != V2_DIRECT_PIECE_KIND || piece.version != SWARM_PROTOCOL_VERSION {
                 return Err(invalid("invalid v2 direct piece frame"));
@@ -1561,7 +1705,7 @@ fn receive_v2_direct_inner(
             {
                 return Err(invalid("v2 direct piece does not match manifest offset"));
             }
-            let ciphertext = BASE64.decode(&piece.ciphertext).map_err(invalid)?;
+            let ciphertext = URL_SAFE_NO_PAD.decode(&piece.ciphertext).map_err(invalid)?;
             let plaintext = open_piece(
                 &job_key,
                 &offer.job.snapshot_root,
@@ -1572,6 +1716,7 @@ fn receive_v2_direct_inner(
             if plaintext.len() as u64 != piece.header.plaintext_length {
                 return Err(invalid("v2 direct piece plaintext length mismatch"));
             }
+            reject_symlink(&partial)?;
             if let Some(parent) = partial.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -1635,7 +1780,7 @@ fn receive_v2_direct_inner(
         digest: offer.job.snapshot_root,
         reason: None,
     };
-    write_json_line(
+    write_v2_frame(
         stream,
         &seal_v2_json(channel, &completion, V2_COMPLETE_AAD)?,
     )?;
@@ -1709,7 +1854,7 @@ fn send_to_peer(
     manager: &TransferManager,
 ) -> io::Result<()> {
     #[cfg(feature = "swarm-v2")]
-    if std::env::var_os("ZAPDROP_SWARM_V2_DIRECT").is_some() {
+    if v2_switch_enabled("ZAPDROP_SWARM_V2_DIRECT") {
         return send_v2_direct(
             app,
             Some(manager),
@@ -1723,7 +1868,7 @@ fn send_to_peer(
         );
     }
     #[cfg(feature = "swarm-v2")]
-    if std::env::var_os("ZAPDROP_SWARM_V2_PROBE").is_some() {
+    if v2_switch_enabled("ZAPDROP_SWARM_V2_PROBE") {
         return send_v2_secure_probe(identity, store, device_name, peer, transfer_id);
     }
     let address: SocketAddr = peer.endpoint.parse().map_err(invalid)?;
@@ -2159,6 +2304,7 @@ fn build_manifest(sources: &[TransferSource]) -> io::Result<Vec<ManifestItem>> {
             &mut items,
         )?;
     }
+    items.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(items)
 }
 fn collect_files(path: &Path, relative: String, items: &mut Vec<ManifestItem>) -> io::Result<()> {
@@ -2211,7 +2357,11 @@ fn source_for_item(sources: &[TransferSource], item: &ManifestItem) -> io::Resul
 }
 
 pub fn validate_relative_path(value: &str) -> io::Result<()> {
-    if value.is_empty() || value.contains('\0') || Path::new(value).is_absolute() {
+    if value.is_empty()
+        || value.contains('\0')
+        || value.contains('\\')
+        || Path::new(value).is_absolute()
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "path must be relative",
@@ -2268,14 +2418,16 @@ fn destination_path(root: &Path, relative: &str, policy: &str) -> io::Result<Opt
             ));
         }
     }
-    if fs::symlink_metadata(&candidate)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "destination symlink is not allowed",
-        ));
+    match fs::symlink_metadata(&candidate) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "destination symlink is not allowed",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     if candidate.exists() {
         match policy {
@@ -2413,12 +2565,61 @@ fn history_entry(
 fn read_json_line_from_reader<T: for<'de> Deserialize<'de>>(
     reader: &mut impl BufRead,
 ) -> io::Result<T> {
-    let mut line = Vec::new();
-    reader.read_until(b'\n', &mut line)?;
-    if line.len() > 64 * 1024 {
-        return Err(invalid("transfer frame too large"));
+    read_json_line_limited(reader, 64 * 1024)
+}
+
+fn read_json_line_limited<T: for<'de> Deserialize<'de>>(
+    reader: &mut impl BufRead,
+    max_bytes: usize,
+) -> io::Result<T> {
+    let mut line = Vec::with_capacity(max_bytes.min(8 * 1024));
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "transfer frame ended before newline",
+                ));
+            }
+            return Err(invalid("transfer frame ended before newline"));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(consumed) > max_bytes {
+            return Err(invalid("transfer frame too large"));
+        }
+        line.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return serde_json::from_slice(line.trim_ascii()).map_err(invalid);
+        }
     }
-    serde_json::from_slice(line.trim_ascii()).map_err(invalid)
+}
+
+#[cfg(feature = "swarm-v2")]
+fn write_v2_frame<T: Serialize>(stream: &TcpStream, value: &T) -> io::Result<()> {
+    let payload = serde_json::to_vec(value).map_err(invalid)?;
+    if payload.is_empty() || payload.len() > MAX_V2_FRAME_BYTES {
+        return Err(invalid("v2 frame exceeds protocol limit"));
+    }
+    let length = u32::try_from(payload.len()).map_err(|_| invalid("v2 frame length overflow"))?;
+    let mut writer = stream.try_clone()?;
+    writer.write_all(&length.to_be_bytes())?;
+    writer.write_all(&payload)
+}
+
+#[cfg(feature = "swarm-v2")]
+fn read_v2_frame<T: for<'de> Deserialize<'de>>(reader: &mut impl BufRead) -> io::Result<T> {
+    let mut length_bytes = [0u8; 4];
+    reader.read_exact(&mut length_bytes)?;
+    let length = u32::from_be_bytes(length_bytes) as usize;
+    if length == 0 || length > MAX_V2_FRAME_BYTES {
+        return Err(invalid("v2 frame exceeds protocol limit"));
+    }
+    let mut payload = vec![0u8; length];
+    reader.read_exact(&mut payload)?;
+    serde_json::from_slice(&payload).map_err(invalid)
 }
 
 fn write_error(stream: &TcpStream, reason: &str) -> io::Result<()> {
@@ -2454,6 +2655,7 @@ mod tests {
     };
     use std::{
         fs,
+        io::Cursor,
         net::TcpListener,
         path::PathBuf,
         sync::{Arc, Barrier, Mutex},
@@ -2840,6 +3042,109 @@ mod tests {
         )
         .is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "swarm-v2")]
+    #[test]
+    fn secure_v2_offer_rejects_unsafe_metadata_and_snapshot_mismatch() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-v2-validation-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let sender_store = SettingsStore::new(root.join("sender-data"));
+        let receiver_store = SettingsStore::new(root.join("receiver-data"));
+        let sender = DeviceIdentity::load_or_create(&sender_store).unwrap();
+        let receiver = DeviceIdentity::load_or_create(&receiver_store).unwrap();
+        let signing_key = sender.signing_key(&sender_store).unwrap();
+        let item = ManifestItem {
+            item_id: "item-1".to_string(),
+            relative_path: "file.txt".to_string(),
+            kind: "file".to_string(),
+            size: 1,
+            sha256: digest_bytes(b"x"),
+        };
+        let (job, _) = create_v2_job(
+            &sender,
+            "validation-job",
+            &receiver.device_id,
+            std::slice::from_ref(&item),
+            &signing_key,
+        )
+        .unwrap();
+        let receiver_context = test_context(
+            receiver.clone(),
+            receiver_store,
+            TrustedPeerStore::load(&SettingsStore::new(root.join("receiver-data"))).unwrap(),
+            root.join("received"),
+            "Receiver",
+        );
+        let sender_key = VerifyingKey::from_bytes(
+            &BASE64
+                .decode(&sender.public_key)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut unsafe_offer = V2DirectOffer {
+            kind: V2_DIRECT_OFFER_KIND.to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job: job.clone(),
+            items: vec![item.clone()],
+            total_bytes: 1,
+            conflict_policy: "rename".to_string(),
+            key_envelope: None,
+        };
+        unsafe_offer.job.job_id = "../escape".to_string();
+        sign_v2_job(&mut unsafe_offer.job, &signing_key).unwrap();
+        assert!(validate_v2_direct_offer(
+            &unsafe_offer,
+            &receiver_context,
+            &sender.device_id,
+            &sender_key
+        )
+        .is_err());
+
+        let mut mismatched_offer = V2DirectOffer {
+            kind: V2_DIRECT_OFFER_KIND.to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job,
+            items: vec![item.clone()],
+            total_bytes: 1,
+            conflict_policy: "rename".to_string(),
+            key_envelope: None,
+        };
+        mismatched_offer.job.snapshot_root =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        sign_v2_job(&mut mismatched_offer.job, &signing_key).unwrap();
+        assert!(validate_v2_direct_offer(
+            &mismatched_offer,
+            &receiver_context,
+            &sender.device_id,
+            &sender_key
+        )
+        .is_err());
+
+        let mut duplicate_offer = mismatched_offer;
+        duplicate_offer.job.snapshot_root =
+            v2_snapshot_root(&[item.clone(), item.clone()]).unwrap();
+        duplicate_offer.items = vec![item.clone(), item];
+        duplicate_offer.total_bytes = 2;
+        sign_v2_job(&mut duplicate_offer.job, &signing_key).unwrap();
+        assert!(validate_v2_direct_offer(
+            &duplicate_offer,
+            &receiver_context,
+            &sender.device_id,
+            &sender_key
+        )
+        .is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "swarm-v2")]
+    #[test]
+    fn secure_v2_frame_rejects_oversized_length_before_allocation() {
+        let mut reader = std::io::BufReader::new(Cursor::new(u32::MAX.to_be_bytes().to_vec()));
+        assert!(read_v2_frame::<serde_json::Value>(&mut reader).is_err());
     }
 
     #[cfg(feature = "swarm-v2")]
