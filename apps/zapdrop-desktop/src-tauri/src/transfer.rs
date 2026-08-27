@@ -505,6 +505,7 @@ impl ReceiveOfferCoordinator {
         let _ = context.history.record(TransferHistoryEntry {
             id: format!("{}:{}", manifest.transfer_id, pending.peer_id),
             transfer_id: manifest.transfer_id.clone(),
+            parent_id: None,
             direction: "receive".to_string(),
             peer_id: pending.peer_id.clone(),
             peer_name: pending.peer_name.clone(),
@@ -773,6 +774,41 @@ impl TransferManager {
             .expect("active transfer set poisoned")
             .insert(transfer_id.clone(), selected.len());
         let item_count = manifest.len();
+        let parent_source_names = request
+            .sources
+            .iter()
+            .map(|source| {
+                source.relative_path.clone().unwrap_or_else(|| {
+                    source
+                        .path
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(&source.path)
+                        .to_string()
+                })
+            })
+            .collect::<Vec<_>>();
+        let _ = self.history.record(TransferHistoryEntry {
+            id: transfer_id.clone(),
+            transfer_id: transfer_id.clone(),
+            parent_id: None,
+            direction: "send".to_string(),
+            peer_id: "swarm".to_string(),
+            peer_name: "Swarm job".to_string(),
+            status: "started".to_string(),
+            source_names: parent_source_names,
+            items: item_count,
+            total_bytes,
+            bytes_done: 0,
+            conflict_policy: request
+                .conflict_policy
+                .clone()
+                .unwrap_or_else(|| "rename".to_string()),
+            started_at: epoch_seconds(),
+            finished_at: None,
+            error: None,
+        });
+        let expected_children = selected.len();
         for peer in selected {
             let started_at = epoch_seconds();
             let source_names = request
@@ -801,9 +837,11 @@ impl TransferManager {
                 .unwrap_or_else(|| "rename".to_string());
             let transfer_id = transfer_id.clone();
             let manager = manager.clone();
+            let expected_children = expected_children;
             let _ = history.record(TransferHistoryEntry {
                 id: format!("{}:{}", transfer_id, peer.id),
                 transfer_id: transfer_id.clone(),
+                parent_id: Some(transfer_id.clone()),
                 direction: "send".to_string(),
                 peer_id: peer.id.clone(),
                 peer_name: peer.name.clone(),
@@ -870,7 +908,17 @@ impl TransferManager {
                         source_names.clone(),
                         &policy,
                         started_at,
+                        Some(transfer_id.clone()),
                     ));
+                    reconcile_parent_history(
+                        &history,
+                        &transfer_id,
+                        expected_children,
+                        source_names.clone(),
+                        item_count,
+                        total_bytes,
+                        &policy,
+                    );
                     let event = if progress.status == "completed" {
                         "transfer-complete"
                     } else if progress.status == "cancelled" {
@@ -1422,6 +1470,7 @@ fn receive_v2_direct(
     let _ = context.history.record(TransferHistoryEntry {
         id: format!("{transfer_id}:{peer_id}"),
         transfer_id: transfer_id.clone(),
+        parent_id: None,
         direction: "receive".to_string(),
         peer_id: peer_id.to_string(),
         peer_name: peer_name.to_string(),
@@ -1477,9 +1526,13 @@ fn receive_v2_direct(
         total_items,
         error: error.clone(),
     };
-    let _ = context
-        .history
-        .record(history_entry(&progress, source_names, &policy, started_at));
+    let _ = context.history.record(history_entry(
+        &progress,
+        source_names,
+        &policy,
+        started_at,
+        None,
+    ));
     let event = match status {
         "completed" => "transfer-complete",
         _ => "transfer-failed",
@@ -2160,6 +2213,7 @@ fn finish_received_transfer(
         source_names,
         &manifest.conflict_policy,
         started_at,
+        None,
     ));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
     let _ = write_json_line(
@@ -2626,15 +2680,81 @@ fn emit_progress(
         },
     );
 }
+fn reconcile_parent_history(
+    history: &HistoryStore,
+    parent_id: &str,
+    expected_children: usize,
+    source_names: Vec<String>,
+    items: usize,
+    total_bytes: u64,
+    policy: &str,
+) {
+    let children = history
+        .list()
+        .into_iter()
+        .filter(|entry| entry.parent_id.as_deref() == Some(parent_id))
+        .collect::<Vec<_>>();
+    if children.len() < expected_children {
+        return;
+    }
+    let completed = children
+        .iter()
+        .filter(|entry| entry.status == "completed")
+        .count();
+    let cancelled = children
+        .iter()
+        .filter(|entry| entry.status == "cancelled")
+        .count();
+    let status = if completed == expected_children {
+        "completed"
+    } else if completed > 0 {
+        "partial"
+    } else if cancelled == expected_children {
+        "cancelled"
+    } else {
+        "failed"
+    };
+    let error = if status == "partial" || status == "failed" {
+        Some(format!(
+            "{completed}/{expected_children} recipient sessions completed"
+        ))
+    } else {
+        None
+    };
+    let _ = history.record(TransferHistoryEntry {
+        id: parent_id.to_string(),
+        transfer_id: parent_id.to_string(),
+        parent_id: None,
+        direction: "send".to_string(),
+        peer_id: "swarm".to_string(),
+        peer_name: "Swarm job".to_string(),
+        status: status.to_string(),
+        source_names,
+        items,
+        total_bytes,
+        bytes_done: children.iter().map(|entry| entry.bytes_done).sum(),
+        conflict_policy: policy.to_string(),
+        started_at: children
+            .iter()
+            .map(|entry| entry.started_at)
+            .min()
+            .unwrap_or_else(epoch_seconds),
+        finished_at: Some(epoch_seconds()),
+        error,
+    });
+}
+
 fn history_entry(
     progress: &TransferProgress,
     source_names: Vec<String>,
     policy: &str,
     started_at: u64,
+    parent_id: Option<String>,
 ) -> TransferHistoryEntry {
     TransferHistoryEntry {
         id: format!("{}:{}", progress.transfer_id, progress.peer_id),
         transfer_id: progress.transfer_id.clone(),
+        parent_id,
         direction: progress.direction.clone(),
         peer_id: progress.peer_id.clone(),
         peer_name: progress.peer_name.clone(),
@@ -3296,6 +3416,71 @@ mod tests {
         )
         .unwrap();
         server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parent_history_reconciles_partial_success() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-parent-history-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let store = HistoryStore::load(&SettingsStore::new(root.clone())).unwrap();
+        store
+            .record(TransferHistoryEntry {
+                id: "parent-job".to_string(),
+                transfer_id: "parent-job".to_string(),
+                parent_id: None,
+                direction: "send".to_string(),
+                peer_id: "swarm".to_string(),
+                peer_name: "Swarm job".to_string(),
+                status: "started".to_string(),
+                source_names: vec!["folder".to_string()],
+                items: 1,
+                total_bytes: 10,
+                bytes_done: 0,
+                conflict_policy: "rename".to_string(),
+                started_at: 1,
+                finished_at: None,
+                error: None,
+            })
+            .unwrap();
+        for (peer, status, bytes) in [("peer-a", "completed", 10), ("peer-b", "failed", 0)] {
+            store
+                .record(TransferHistoryEntry {
+                    id: format!("parent-job:{peer}"),
+                    transfer_id: "parent-job".to_string(),
+                    parent_id: Some("parent-job".to_string()),
+                    direction: "send".to_string(),
+                    peer_id: peer.to_string(),
+                    peer_name: peer.to_string(),
+                    status: status.to_string(),
+                    source_names: vec!["folder".to_string()],
+                    items: 1,
+                    total_bytes: 10,
+                    bytes_done: bytes,
+                    conflict_policy: "rename".to_string(),
+                    started_at: 1,
+                    finished_at: Some(2),
+                    error: None,
+                })
+                .unwrap();
+        }
+        reconcile_parent_history(
+            &store,
+            "parent-job",
+            2,
+            vec!["folder".to_string()],
+            1,
+            10,
+            "rename",
+        );
+        let parent = store
+            .list()
+            .into_iter()
+            .find(|entry| entry.id == "parent-job")
+            .unwrap();
+        assert_eq!(parent.status, "partial");
+        assert_eq!(parent.bytes_done, 10);
         fs::remove_dir_all(root).unwrap();
     }
 

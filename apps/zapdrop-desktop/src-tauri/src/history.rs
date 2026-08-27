@@ -14,6 +14,8 @@ const MAX_HISTORY_ENTRIES: usize = 500;
 pub struct TransferHistoryEntry {
     pub id: String,
     pub transfer_id: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
     pub direction: String,
     pub peer_id: String,
     pub peer_name: String,
@@ -104,6 +106,7 @@ mod tests {
             .record(TransferHistoryEntry {
                 id: "h1".into(),
                 transfer_id: "t1".into(),
+                parent_id: None,
                 direction: "send".into(),
                 peer_id: "p1".into(),
                 peer_name: "Desk".into(),

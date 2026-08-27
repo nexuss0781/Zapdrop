@@ -137,7 +137,9 @@ The remaining Phase 7 work is a network paged-metadata exchange for very large t
 
 **Objective:** Make group transfer the primary product abstraction.
 
-Implement parent jobs and recipient child sessions, global bandwidth and resource budgets, per-recipient fairness, queued recipients, per-peer retry/cancel, aggregate progress, partial-success semantics, and group history. The default direct mode should support at least two, four, and eight trusted recipients and simultaneous transfers in both directions.
+**Implementation status:** The first direct fan-out accounting slice is implemented. A multi-recipient send creates one parent history record and independent child session records. Child records carry an optional `parentId`; the parent is reconciled into `completed`, `partial`, `failed`, or `cancelled` only after all expected child sessions reach terminal state. The existing bounded limit of eight recipients and simultaneous bidirectional direct-transfer behavior remain in force.
+
+The remaining Phase 8 work is a first-class UI parent-job view, global bandwidth and disk/CPU budgets, fairness scheduling beyond independent thread launch, queued recipients above the active-session limit, per-recipient retry/cancel commands, and mixed file/folder multi-PC qualification. See `docs/ZAPDROP_PHASE8_STATUS.md`.
 
 **Acceptance gate:** One source can complete a mixed file/folder job to multiple recipients; one failure does not affect successful peers; slow peers do not starve the group; and all child outcomes reconcile correctly into the parent history.
 
