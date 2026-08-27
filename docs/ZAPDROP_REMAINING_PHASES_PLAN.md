@@ -98,29 +98,37 @@ Centralize partial-file and journal reconciliation so a non-final length mismatc
 
 **Exit evidence:** Deterministic mismatch-boundary tests and the real v2 persisted sparse-resume loopback pass in the full qualification harness. See `docs/ZAPDROP_PHASE10_STALE_STATE_RECOVERY.md`.
 
-### Phase 11 — Process-termination and snapshot integration acceptance
+### Phase 11 — Crash-artifact journal recovery acceptance
+
+**State:** Complete in this revision; actual process termination and physical-PC gates remain open.
+
+Verify that stale temporary files cannot replace the last committed journal and that truncated or wrong-kind journal records fail closed. Keep the receiver’s partial-file and journal mismatch reset behavior covered by deterministic tests.
+
+**Exit evidence:** Crash-artifact and malformed-journal tests pass in default and `swarm-v2` builds, the sparse-resume loopback remains green, and the full qualification harness passes. See `docs/ZAPDROP_PHASE10_STALE_STATE_RECOVERY.md`.
+
+### Phase 12 — Process-termination and remaining snapshot integration acceptance
 
 Qualify recovery after an actual receiver-process termination, multi-page metadata transport, subtree reuse across independent network snapshots, and explicit source-mutation revisions. Keep the 4 GiB-plus physical-file requirement as a separately recorded hardware gate.
 
-### Phase 12 — Phase 9 direct-only topology integration
+### Phase 13 — Phase 9 direct-only topology integration
 
 Only after the direct path and authorization gates are stable, implement the least-privilege tree/mesh data plane behind an explicit feature flag. Enforce signed job scope, relay consent, object allow-lists, byte budgets, expiry, revocation, and direct fallback. Do not enable arbitrary forwarding.
 
 **Exit evidence:** Multi-process tests demonstrate that unauthorized relays cannot receive or forward unrelated content, and direct fallback remains functional.
 
-### Phase 13 — Phase 10 repair integration
+### Phase 14 — Phase 10 repair integration
 
 Evaluate repair coding against measured loss conditions, then integrate only a bounded encrypted repair path if it improves completion time or source amplification without unacceptable CPU/memory cost. Keep systematic direct transfer as the reference path.
 
 **Exit evidence:** Loss-injection benchmark, resource measurements, protocol tests, and an explicit decision to enable or defer repair.
 
-### Phase 14 — Phase 11 companion runtime boundary
+### Phase 15 — Phase 11 companion runtime boundary
 
 Implement the companion’s authenticated pairing, receive approval, send/receive operations, snapshot/piece/journal compatibility, and version negotiation only for platforms that can be built and tested honestly. If legacy Windows runtime support cannot be qualified, publish a clear supported-platform boundary instead of claiming compatibility.
 
 **Exit evidence:** Modern desktop and companion exchange content in a reproducible test, or the unsupported-platform boundary is documented and enforced.
 
-### Phase 15 — Final Windows release and physical qualification
+### Phase 16 — Final Windows release and physical qualification
 
 Run the full automated gate, build Windows artifacts, perform the physical-LAN matrix, record privacy and firewall behavior, publish compatibility and known limitations, and package only artifacts whose signing and runtime status are explicit.
 
@@ -128,4 +136,4 @@ Run the full automated gate, build Windows artifacts, perform the physical-LAN m
 
 ## Immediate next move
 
-Phase 10 is complete in this revision. The next implementation action is **Phase 11 only**: qualify process termination and remaining snapshot integration. No tree/mesh, repair, companion, or release work will be started in the same phase. Phase 11 must be tested, documented, committed, and pushed before the next phase begins.
+Phase 11 is complete in this revision. The next implementation action is **Phase 12 only**: qualify actual process termination and remaining snapshot integration. No tree/mesh, repair, companion, or release work will be started in the same phase. Phase 12 must be tested, documented, committed, and pushed before the next phase begins.

@@ -1128,6 +1128,44 @@ mod tests {
     }
 
     #[test]
+    fn journal_atomic_save_ignores_stale_temporary_artifacts() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-journal-crash-{}", uuid::Uuid::new_v4()));
+        let path = root.join("nested/journal.json");
+        let mut journal = TransferJournal::new("job-atomic".to_string(), "root-atomic".to_string());
+        journal.save_atomic(&path).unwrap();
+        fs::write(path.with_extension("tmp"), b"{truncated").unwrap();
+        let loaded = TransferJournal::load(&path).unwrap();
+        assert_eq!(loaded.job_id, "job-atomic");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn journal_load_rejects_truncated_or_wrong_kind_records() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-journal-invalid-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("journal.json");
+        fs::write(&path, b"{\"kind\":\"zapdrop_transfer_journal\"").unwrap();
+        assert!(TransferJournal::load(&path).is_err());
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "kind": "wrong",
+                "version": 1,
+                "jobId": "job",
+                "snapshotRoot": "root",
+                "updatedAt": 1,
+                "items": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(TransferJournal::load(&path).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn journal_round_trips_atomically() {
         let root = std::env::temp_dir().join(format!("zapdrop-journal-{}", uuid::Uuid::new_v4()));
         let path = root.join("nested/journal.json");

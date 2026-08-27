@@ -23,7 +23,9 @@ run_test() {
 for test_name in \
   qualifies_large_fixture_determinism_and_bounded_metadata \
   persists_sparse_resume_ranges_for_large_file_fixture \
-  metadata_page_roundtrip_rejects_invalid_exchange_data; do
+  metadata_page_roundtrip_rejects_invalid_exchange_data \
+  journal_atomic_save_ignores_stale_temporary_artifacts \
+  journal_load_rejects_truncated_or_wrong_kind_records; do
   run_test "" "$test_name"
 done
 for test_name in \
@@ -35,5 +37,5 @@ for test_name in \
   run_test "swarm-v2" "$test_name"
 done
 
-printf '%s\n' 'Snapshot qualification passed: deterministic 512-file indexing, serialized metadata bounds, subtree reuse, sparse journal persistence, metadata-page exchange validation, stale-state reset, and v2 sparse-resume loopback passed in default and swarm-v2 builds.'
+printf '%s\n' 'Snapshot qualification passed: deterministic 512-file indexing, serialized metadata bounds, subtree reuse, sparse journal persistence, metadata-page exchange validation, stale-state reset, crash-artifact rejection, and v2 sparse-resume loopback passed in default and swarm-v2 builds.'
 printf '%s\n' 'This remains a controlled local fixture; it does not claim 4 GiB-plus physical-file or process-termination acceptance.'
