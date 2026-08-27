@@ -57,11 +57,19 @@ const V2_PIECE_AAD: &[u8] = b"zapdrop/swarm/v2/direct-piece";
 #[cfg(feature = "swarm-v2")]
 const V2_COMPLETE_AAD: &[u8] = b"zapdrop/swarm/v2/direct-complete";
 #[cfg(feature = "swarm-v2")]
+const V2_OBJECT_REQUEST_AAD: &[u8] = b"zapdrop/swarm/v2/direct-object-request";
+#[cfg(feature = "swarm-v2")]
+const V2_OBJECT_RESPONSE_AAD: &[u8] = b"zapdrop/swarm/v2/direct-object-response";
+#[cfg(feature = "swarm-v2")]
 const V2_DIRECT_OFFER_KIND: &str = "zapdrop_swarm_direct_offer";
 #[cfg(feature = "swarm-v2")]
 const V2_DIRECT_DECISION_KIND: &str = "zapdrop_swarm_direct_decision";
 #[cfg(feature = "swarm-v2")]
 const V2_DIRECT_METADATA_KIND: &str = "zapdrop_swarm_direct_metadata_page";
+#[cfg(feature = "swarm-v2")]
+const V2_DIRECT_OBJECT_REQUEST_KIND: &str = "zapdrop_swarm_direct_object_request";
+#[cfg(feature = "swarm-v2")]
+const V2_DIRECT_OBJECT_RESPONSE_KIND: &str = "zapdrop_swarm_direct_object_response";
 #[cfg(feature = "swarm-v2")]
 const V2_DIRECT_READY_KIND: &str = "zapdrop_swarm_direct_ready";
 #[cfg(feature = "swarm-v2")]
@@ -78,6 +86,12 @@ const MAX_V2_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const V2_METADATA_PAGE_BYTES: usize = 16 * 1024;
 #[cfg(feature = "swarm-v2")]
 const MAX_V2_METADATA_PAGES: usize = 2048;
+#[cfg(feature = "swarm-v2")]
+const MAX_V2_METADATA_OBJECTS: usize = 100_000;
+#[cfg(feature = "swarm-v2")]
+const MAX_V2_OBJECTS_PER_REQUEST: usize = 64;
+#[cfg(feature = "swarm-v2")]
+const MAX_V2_OBJECT_RESPONSE_BYTES: usize = MAX_V2_FRAME_BYTES - 64 * 1024;
 
 #[cfg(feature = "swarm-v2")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +124,34 @@ struct V2DirectMetadataPage {
     version: u32,
     job_id: String,
     page: crate::snapshot::SnapshotMetadataPage,
+}
+
+#[cfg(feature = "swarm-v2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2DirectObjectRequest {
+    kind: String,
+    version: u32,
+    job_id: String,
+    objects: Vec<crate::snapshot::SnapshotObjectRef>,
+}
+
+#[cfg(feature = "swarm-v2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2DirectObjectPayload {
+    reference: crate::snapshot::SnapshotObjectRef,
+    data: String,
+}
+
+#[cfg(feature = "swarm-v2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2DirectObjectResponse {
+    kind: String,
+    version: u32,
+    job_id: String,
+    objects: Vec<V2DirectObjectPayload>,
 }
 
 #[cfg(feature = "swarm-v2")]
@@ -263,6 +305,10 @@ pub struct ManifestItem {
     pub kind: String,
     pub size: u64,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_byte_len: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -381,6 +427,7 @@ struct PendingV2TransferOffer {
     reader: BufReader<TcpStream>,
     channel: crate::secure::SecureChannel,
     offer: V2DirectOffer,
+    metadata_objects: Vec<crate::snapshot::SnapshotObjectRef>,
     peer_id: String,
     peer_name: String,
     peer_key: VerifyingKey,
@@ -633,6 +680,7 @@ impl ReceiveOfferCoordinator {
         let stream = pending.stream;
         let mut reader = pending.reader;
         let offer = pending.offer;
+        let metadata_objects = pending.metadata_objects;
         let peer_id = pending.peer_id;
         let peer_name = pending.peer_name;
         let peer_key = pending.peer_key;
@@ -644,6 +692,7 @@ impl ReceiveOfferCoordinator {
                     &mut reader,
                     &mut channel,
                     offer,
+                    &metadata_objects,
                     &receive_context,
                     &peer_id,
                     &peer_name,
@@ -1245,6 +1294,12 @@ pub fn handle_secure_incoming(
         conflicts: existing_v2_conflicts(&context.receive_directory, &offer),
         received_at,
     };
+    let metadata_objects = metadata_pages
+        .iter()
+        .flat_map(|page| page.page.objects.iter())
+        .filter(|object| object.kind != "file")
+        .cloned()
+        .collect::<Vec<_>>();
     if context
         .offers
         .insert_v2(PendingV2TransferOffer {
@@ -1252,6 +1307,7 @@ pub fn handle_secure_incoming(
             reader,
             channel,
             offer,
+            metadata_objects,
             peer_id: trusted.peer_id.clone(),
             peer_name: trusted.name.clone(),
             peer_key,
@@ -1439,88 +1495,214 @@ fn create_v2_job(
 }
 
 #[cfg(feature = "swarm-v2")]
-fn metadata_page_wire_size(
-    transfer_id: &str,
-    objects: &[crate::snapshot::SnapshotObjectRef],
-) -> io::Result<usize> {
-    serde_json::to_vec(&V2DirectMetadataPage {
-        kind: V2_DIRECT_METADATA_KIND.to_string(),
-        version: SWARM_PROTOCOL_VERSION,
-        job_id: transfer_id.to_string(),
-        page: crate::snapshot::SnapshotMetadataPage {
-            kind: "zapdrop_snapshot_metadata_page".to_string(),
-            version: SWARM_PROTOCOL_VERSION,
-            page_id: "0".repeat(64),
-            objects: objects.to_vec(),
-            next_page: Some("0".repeat(64)),
-        },
-    })
-    .map(|bytes| bytes.len())
-    .map_err(invalid)
-}
-
-#[cfg(feature = "swarm-v2")]
 fn build_v2_metadata_pages(
     transfer_id: &str,
-    items: &[ManifestItem],
+    snapshot: &crate::snapshot::SnapshotBuildResult,
 ) -> io::Result<Vec<V2DirectMetadataPage>> {
-    let objects = items
-        .iter()
-        .map(|item| crate::snapshot::SnapshotObjectRef {
-            kind: "file".to_string(),
-            object_id: item.sha256.clone(),
-            byte_len: item.size,
-        })
-        .collect::<Vec<_>>();
-    let mut groups = Vec::new();
-    let mut current = Vec::new();
-    for object in objects {
-        let mut candidate = current.clone();
-        candidate.push(object.clone());
-        if !current.is_empty()
-            && metadata_page_wire_size(transfer_id, &candidate)? > V2_METADATA_PAGE_BYTES
-        {
-            groups.push(current);
-            current = vec![object];
-        } else if current.is_empty()
-            && metadata_page_wire_size(transfer_id, &candidate)? > V2_METADATA_PAGE_BYTES
-        {
-            return Err(invalid("v2 metadata object cannot fit in a page"));
-        } else {
-            current = candidate;
-        }
+    let pages = crate::snapshot::build_metadata_pages(
+        snapshot,
+        V2_METADATA_PAGE_BYTES.saturating_sub(2 * 1024),
+    )?;
+    if pages.is_empty() || pages.len() > MAX_V2_METADATA_PAGES {
+        return Err(invalid("v2 metadata page chain has an invalid length"));
     }
-    if !current.is_empty() {
-        groups.push(current);
-    }
-    if groups.is_empty() {
-        return Err(invalid("v2 metadata page has no objects"));
-    }
-    if groups.len() > MAX_V2_METADATA_PAGES {
-        return Err(invalid("v2 metadata page chain is too long"));
-    }
-    let mut pages = Vec::with_capacity(groups.len());
-    let mut next = None;
-    for objects in groups.into_iter().rev() {
-        let mut page = crate::snapshot::SnapshotMetadataPage {
-            kind: "zapdrop_snapshot_metadata_page".to_string(),
-            version: SWARM_PROTOCOL_VERSION,
-            page_id: "pending".to_string(),
-            objects,
-            next_page: next.clone(),
-        };
-        page.page_id = digest_bytes(&serde_json::to_vec(&page).map_err(invalid)?);
-        page.validate()?;
-        pages.push(V2DirectMetadataPage {
+    let pages = pages
+        .into_iter()
+        .map(|page| V2DirectMetadataPage {
             kind: V2_DIRECT_METADATA_KIND.to_string(),
             version: SWARM_PROTOCOL_VERSION,
             job_id: transfer_id.to_string(),
             page,
-        });
-        next = Some(pages.last().unwrap().page.page_id.clone());
+        })
+        .collect::<Vec<_>>();
+    if pages.iter().any(|page| {
+        serde_json::to_vec(page)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX)
+            > V2_METADATA_PAGE_BYTES
+    }) {
+        return Err(invalid("v2 metadata envelope exceeds its page bound"));
     }
-    pages.reverse();
     Ok(pages)
+}
+
+#[cfg(feature = "swarm-v2")]
+fn build_v2_object_request(
+    job_id: &str,
+    metadata_objects: &[crate::snapshot::SnapshotObjectRef],
+) -> io::Result<V2DirectObjectRequest> {
+    let mut objects = Vec::new();
+    let mut seen = HashSet::new();
+    for object in metadata_objects {
+        if object.kind == "file" {
+            continue;
+        }
+        if !seen.insert((object.kind.clone(), object.object_id.clone())) {
+            continue;
+        }
+        objects.push(object.clone());
+    }
+    if objects.len() > MAX_V2_OBJECTS_PER_REQUEST {
+        return Err(invalid("v2 object request exceeds per-frame object limit"));
+    }
+    Ok(V2DirectObjectRequest {
+        kind: V2_DIRECT_OBJECT_REQUEST_KIND.to_string(),
+        version: SWARM_PROTOCOL_VERSION,
+        job_id: job_id.to_string(),
+        objects,
+    })
+}
+
+#[cfg(feature = "swarm-v2")]
+fn snapshot_object_bytes(
+    snapshot: &crate::snapshot::SnapshotBuildResult,
+    reference: &crate::snapshot::SnapshotObjectRef,
+) -> io::Result<Vec<u8>> {
+    match reference.kind.as_str() {
+        "directory" => snapshot
+            .directories
+            .iter()
+            .find(|object| object.object_id == reference.object_id)
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("requested directory object is unavailable")),
+        "piece-index" => snapshot
+            .piece_pages
+            .iter()
+            .find(|object| object.page_id == reference.object_id)
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("requested piece-index object is unavailable")),
+        _ => Err(invalid("v2 object request contains an unsupported kind")),
+    }
+}
+
+#[cfg(feature = "swarm-v2")]
+fn validate_v2_snapshot_object_payload(
+    reference: &crate::snapshot::SnapshotObjectRef,
+    bytes: &[u8],
+) -> io::Result<()> {
+    if bytes.len() as u64 != reference.byte_len {
+        return Err(invalid("v2 snapshot object length mismatch"));
+    }
+    match reference.kind.as_str() {
+        "directory" => {
+            let object: crate::swarm::DirectoryNode =
+                serde_json::from_slice(bytes).map_err(invalid)?;
+            if object.kind != "zapdrop_directory_node" || object.object_id != reference.object_id {
+                return Err(invalid("invalid directory object payload"));
+            }
+            let mut canonical = object;
+            canonical.object_id = "pending".to_string();
+            if digest_bytes(&serde_json::to_vec(&canonical).map_err(invalid)?)
+                != reference.object_id
+            {
+                return Err(invalid("directory object ID does not match content"));
+            }
+        }
+        "piece-index" => {
+            let object: crate::snapshot::PieceIndexPage =
+                serde_json::from_slice(bytes).map_err(invalid)?;
+            if object.kind != "zapdrop_piece_index_page" || object.page_id != reference.object_id {
+                return Err(invalid("invalid piece-index object payload"));
+            }
+            let mut canonical = object;
+            canonical.page_id = "pending".to_string();
+            if digest_bytes(&serde_json::to_vec(&canonical).map_err(invalid)?)
+                != reference.object_id
+            {
+                return Err(invalid("piece-index object ID does not match content"));
+            }
+        }
+        _ => return Err(invalid("unsupported v2 snapshot object kind")),
+    }
+    Ok(())
+}
+
+#[cfg(feature = "swarm-v2")]
+fn build_v2_object_response(
+    request: &V2DirectObjectRequest,
+    snapshot: &crate::snapshot::SnapshotBuildResult,
+) -> io::Result<V2DirectObjectResponse> {
+    if request.kind != V2_DIRECT_OBJECT_REQUEST_KIND
+        || request.version != SWARM_PROTOCOL_VERSION
+        || request.objects.len() > MAX_V2_OBJECTS_PER_REQUEST
+    {
+        return Err(invalid("invalid v2 object request"));
+    }
+    let catalog = crate::snapshot::SnapshotObjectCatalog::from_snapshot(snapshot);
+    let mut objects = Vec::with_capacity(request.objects.len());
+    let mut seen = HashSet::new();
+    for reference in &request.objects {
+        if !seen.insert((reference.kind.clone(), reference.object_id.clone())) {
+            return Err(invalid("duplicate v2 object request"));
+        }
+        let Some(allowed) = catalog.get(&reference.kind, &reference.object_id) else {
+            return Err(invalid("requested v2 object is not in the snapshot"));
+        };
+        if allowed.byte_len != reference.byte_len {
+            return Err(invalid("requested v2 object length mismatch"));
+        }
+        let bytes = snapshot_object_bytes(snapshot, reference)?;
+        validate_v2_snapshot_object_payload(reference, &bytes)?;
+        objects.push(V2DirectObjectPayload {
+            reference: reference.clone(),
+            data: URL_SAFE_NO_PAD.encode(bytes),
+        });
+    }
+    let response = V2DirectObjectResponse {
+        kind: V2_DIRECT_OBJECT_RESPONSE_KIND.to_string(),
+        version: SWARM_PROTOCOL_VERSION,
+        job_id: request.job_id.clone(),
+        objects,
+    };
+    if serde_json::to_vec(&response).map_err(invalid)?.len() > MAX_V2_OBJECT_RESPONSE_BYTES {
+        return Err(invalid("v2 object response exceeds per-frame byte limit"));
+    }
+    Ok(response)
+}
+
+#[cfg(feature = "swarm-v2")]
+fn validate_v2_object_response(
+    response: &V2DirectObjectResponse,
+    request: &V2DirectObjectRequest,
+) -> io::Result<()> {
+    if response.kind != V2_DIRECT_OBJECT_RESPONSE_KIND
+        || response.version != SWARM_PROTOCOL_VERSION
+        || response.job_id != request.job_id
+        || response.objects.len() != request.objects.len()
+        || response.objects.len() > MAX_V2_OBJECTS_PER_REQUEST
+        || serde_json::to_vec(response).map_err(invalid)?.len() > MAX_V2_OBJECT_RESPONSE_BYTES
+    {
+        return Err(invalid("invalid v2 object response"));
+    }
+    let requested = request
+        .objects
+        .iter()
+        .map(|object| {
+            (
+                object.kind.clone(),
+                object.object_id.clone(),
+                object.byte_len,
+            )
+        })
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    for payload in &response.objects {
+        let key = (
+            payload.reference.kind.clone(),
+            payload.reference.object_id.clone(),
+            payload.reference.byte_len,
+        );
+        if !requested.contains(&key) || !seen.insert(key) {
+            return Err(invalid("v2 object response does not match request"));
+        }
+        let bytes = URL_SAFE_NO_PAD.decode(&payload.data).map_err(invalid)?;
+        validate_v2_snapshot_object_payload(&payload.reference, &bytes)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "swarm-v2")]
@@ -1533,6 +1715,7 @@ fn validate_v2_metadata_pages(
         return Err(invalid("invalid v2 metadata page chain length"));
     }
     let mut actual = Vec::new();
+    let mut object_count = 0usize;
     for (index, page) in metadata.iter().enumerate() {
         if page.kind != V2_DIRECT_METADATA_KIND
             || page.version != SWARM_PROTOCOL_VERSION
@@ -1561,11 +1744,21 @@ fn validate_v2_metadata_pages(
                 .filter(|object| object.kind == "file")
                 .map(|object| (object.object_id.clone(), object.byte_len)),
         );
+        object_count = object_count.saturating_add(page.page.objects.len());
+        if object_count > MAX_V2_METADATA_OBJECTS {
+            return Err(invalid("v2 metadata chain contains too many objects"));
+        }
     }
-    let mut expected = items
-        .iter()
-        .map(|item| (item.sha256.clone(), item.size))
-        .collect::<Vec<_>>();
+    let mut expected = Vec::with_capacity(items.len());
+    for item in items {
+        expected.push((
+            item.object_id
+                .clone()
+                .ok_or_else(|| invalid("v2 manifest is missing a file object ID"))?,
+            item.object_byte_len
+                .ok_or_else(|| invalid("v2 manifest is missing a file object length"))?,
+        ));
+    }
     expected.sort_unstable();
     actual.sort_unstable();
     if actual != expected {
@@ -1635,7 +1828,8 @@ fn send_v2_direct(
         hash: "sha256".to_string(),
         aead: "x25519-hkdf-sha256-chacha20poly1305".to_string(),
     };
-    let manifest = build_v2_manifest(sources, &profile)?;
+    let snapshot = build_v2_snapshot(sources, &profile)?;
+    let manifest = manifest_from_v2_snapshot(&snapshot);
     verify_v2_sources_unchanged(sources, &manifest)?;
     let total_bytes = manifest.iter().try_fold(0u64, |total, item| {
         total
@@ -1652,7 +1846,7 @@ fn send_v2_direct(
         conflict_policy: policy.to_string(),
         key_envelope: None,
     };
-    let metadata_pages = build_v2_metadata_pages(&job.job_id, &manifest)?;
+    let metadata_pages = build_v2_metadata_pages(&job.job_id, &snapshot)?;
     for metadata in &metadata_pages {
         write_v2_frame(
             &stream,
@@ -1681,6 +1875,17 @@ fn send_v2_direct(
     write_v2_frame(
         &stream,
         &seal_v2_json(&mut channel, &key_provision, V2_JOB_AAD)?,
+    )?;
+    let object_request_frame: EncryptedFrame = read_v2_frame(&mut reader)?;
+    let object_request: V2DirectObjectRequest =
+        open_v2_json(&mut channel, &object_request_frame, V2_OBJECT_REQUEST_AAD)?;
+    if object_request.job_id != job.job_id {
+        return Err(invalid("v2 object request job mismatch"));
+    }
+    let object_response = build_v2_object_response(&object_request, &snapshot)?;
+    write_v2_frame(
+        &stream,
+        &seal_v2_json(&mut channel, &object_response, V2_OBJECT_RESPONSE_AAD)?,
     )?;
     let ready_frame: EncryptedFrame = read_v2_frame(&mut reader)?;
     let ready: V2DirectReady = open_v2_json(&mut channel, &ready_frame, V2_JOB_AAD)?;
@@ -1806,6 +2011,7 @@ fn receive_v2_direct(
     reader: &mut BufReader<TcpStream>,
     channel: &mut crate::secure::SecureChannel,
     offer: V2DirectOffer,
+    metadata_objects: &[crate::snapshot::SnapshotObjectRef],
     context: &TransferServerContext,
     peer_id: &str,
     peer_name: &str,
@@ -1858,6 +2064,7 @@ fn receive_v2_direct(
         reader,
         channel,
         offer,
+        metadata_objects,
         context,
         peer_id,
         peer_name,
@@ -1949,6 +2156,15 @@ fn validate_v2_direct_offer(
         if !is_sha256_hex(&item.sha256) {
             return Err(invalid("v2 direct manifest contains an invalid digest"));
         }
+        let object_id = item
+            .object_id
+            .as_deref()
+            .ok_or_else(|| invalid("v2 direct manifest is missing a file object ID"))?;
+        if !is_sha256_hex(object_id) || item.object_byte_len.unwrap_or(0) == 0 {
+            return Err(invalid(
+                "v2 direct manifest contains an invalid file object commitment",
+            ));
+        }
         total
             .checked_add(item.size)
             .ok_or_else(|| invalid("v2 direct size overflow"))
@@ -2029,6 +2245,7 @@ fn receive_v2_direct_inner(
     reader: &mut BufReader<TcpStream>,
     channel: &mut crate::secure::SecureChannel,
     offer: V2DirectOffer,
+    metadata_objects: &[crate::snapshot::SnapshotObjectRef],
     context: &TransferServerContext,
     peer_id: &str,
     peer_name: &str,
@@ -2066,6 +2283,15 @@ fn receive_v2_direct_inner(
             &context.identity.device_id,
         )
         .map_err(invalid)?;
+    let object_request = build_v2_object_request(&offer.job.job_id, metadata_objects)?;
+    write_v2_frame(
+        stream,
+        &seal_v2_json(channel, &object_request, V2_OBJECT_REQUEST_AAD)?,
+    )?;
+    let object_response_frame: EncryptedFrame = read_v2_frame(reader)?;
+    let object_response: V2DirectObjectResponse =
+        open_v2_json(channel, &object_response_frame, V2_OBJECT_RESPONSE_AAD)?;
+    validate_v2_object_response(&object_response, &object_request)?;
     let journal_file = crate::snapshot::journal_path(&destination, &offer.job.job_id);
     let mut journal = match crate::snapshot::TransferJournal::load(&journal_file) {
         Ok(existing)
@@ -2765,10 +2991,10 @@ fn validate_manifest(manifest: &TransferManifest, transfer_id: &str) -> io::Resu
 }
 
 #[cfg(feature = "swarm-v2")]
-fn build_v2_manifest(
+fn build_v2_snapshot(
     sources: &[TransferSource],
     profile: &ChunkProfile,
-) -> io::Result<Vec<ManifestItem>> {
+) -> io::Result<crate::snapshot::SnapshotBuildResult> {
     let snapshot_sources = sources
         .iter()
         .map(|source| {
@@ -2785,26 +3011,36 @@ fn build_v2_manifest(
             }
         })
         .collect::<Vec<_>>();
-    let snapshot = crate::snapshot::build_snapshot(
+    crate::snapshot::build_snapshot(
         &snapshot_sources,
         &crate::snapshot::SnapshotOptions {
             chunk_profile: profile.clone(),
             page_bytes: crate::snapshot::DEFAULT_SNAPSHOT_PAGE_BYTES,
         },
-    )?;
+    )
+}
+
+#[cfg(feature = "swarm-v2")]
+fn manifest_from_v2_snapshot(snapshot: &crate::snapshot::SnapshotBuildResult) -> Vec<ManifestItem> {
     let mut items = snapshot
         .files
-        .into_iter()
+        .iter()
         .map(|file| ManifestItem {
             item_id: stable_item_id(&file.relative_path),
-            relative_path: file.relative_path,
+            relative_path: file.relative_path.clone(),
             kind: "file".to_string(),
             size: file.size,
-            sha256: file.sha256,
+            sha256: file.sha256.clone(),
+            object_id: Some(file.object_id.clone()),
+            object_byte_len: Some(
+                serde_json::to_vec(file)
+                    .map(|bytes| bytes.len() as u64)
+                    .unwrap_or(0),
+            ),
         })
         .collect::<Vec<_>>();
     items.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(items)
+    items
 }
 
 #[cfg(feature = "swarm-v2")]
@@ -2912,6 +3148,8 @@ fn collect_files(path: &Path, relative: String, items: &mut Vec<ManifestItem>) -
             kind: "file".to_string(),
             size: metadata.len(),
             sha256: digest_file(path)?,
+            object_id: None,
+            object_byte_len: None,
         });
     } else {
         return Err(invalid("source is not a regular file or directory"));
@@ -3725,14 +3963,16 @@ mod tests {
 
     #[cfg(feature = "swarm-v2")]
     #[test]
-    fn secure_v2_direct_file_transfer_roundtrip() {
+    fn secure_v2_direct_directory_transfer_retrieves_snapshot_objects() {
         let root = std::env::temp_dir().join(format!("zapdrop-direct-v2-{}", uuid::Uuid::new_v4()));
         let server_data = root.join("server-data");
         let client_data = root.join("client-data");
-        let source = root.join("source.txt");
+        let source = root.join("source-dir");
         let received = root.join("received");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(&source, b"encrypted v2 direct transfer\n").unwrap();
+        fs::create_dir_all(source.join("nested")).unwrap();
+        let large_bytes = vec![0x3cu8; crate::swarm::DEFAULT_PIECE_SIZE as usize + 123];
+        fs::write(source.join("nested/large.bin"), &large_bytes).unwrap();
+        fs::write(source.join("nested/small.txt"), b"directory metadata\n").unwrap();
         let server_store = SettingsStore::new(server_data);
         let client_store = SettingsStore::new(client_data);
         let server_identity = DeviceIdentity::load_or_create(&server_store).unwrap();
@@ -3798,23 +4038,26 @@ mod tests {
                     &peer,
                     &[TransferSource {
                         path: source.to_string_lossy().to_string(),
-                        relative_path: Some("source.txt".to_string()),
+                        relative_path: Some("shared".to_string()),
                     }],
                     "rename",
                     "secure-direct-file",
                 )
             }
         });
-        for _ in 0..20 {
+        let offer_seen = (0..500).any(|_| {
             if approval_offers
                 .list(&received.to_string_lossy())
                 .iter()
                 .any(|offer| offer.transfer_id == "secure-direct-file")
             {
-                break;
+                true
+            } else {
+                thread::sleep(Duration::from_millis(10));
+                false
             }
-            thread::sleep(Duration::from_millis(10));
-        }
+        });
+        assert!(offer_seen, "directory v2 offer was not observed");
         approval_offers
             .accept(
                 "secure-direct-file",
@@ -3826,8 +4069,12 @@ mod tests {
         sender.join().unwrap().unwrap();
         server.join().unwrap();
         assert_eq!(
-            fs::read(received.join("source.txt")).unwrap(),
-            b"encrypted v2 direct transfer\n"
+            fs::read(received.join("shared/nested/large.bin")).unwrap(),
+            large_bytes
+        );
+        assert_eq!(
+            fs::read(received.join("shared/nested/small.txt")).unwrap(),
+            b"directory metadata\n"
         );
         assert!(
             HistoryStore::load(&SettingsStore::new(root.join("server-data")))
@@ -3904,7 +4151,7 @@ mod tests {
             hash: "sha256".to_string(),
             aead: "x25519-hkdf-sha256-chacha20poly1305".to_string(),
         };
-        let manifest = build_v2_manifest(
+        let snapshot = build_v2_snapshot(
             &[TransferSource {
                 path: source.to_string_lossy().to_string(),
                 relative_path: Some("large-source.bin".to_string()),
@@ -3912,6 +4159,7 @@ mod tests {
             &profile,
         )
         .unwrap();
+        let manifest = manifest_from_v2_snapshot(&snapshot);
         let item = manifest.first().unwrap();
         let (job, _) = create_v2_job(
             &client_identity,
@@ -4152,15 +4400,31 @@ mod tests {
         let store = SettingsStore::new(root.clone());
         let identity = DeviceIdentity::load_or_create(&store).unwrap();
         let signing_key = identity.signing_key(&store).unwrap();
-        let items = (0..600)
-            .map(|index| ManifestItem {
-                item_id: format!("item-{index}"),
-                relative_path: format!("fixture/file-{index}.bin"),
-                kind: "file".to_string(),
-                size: index as u64 + 1,
-                sha256: format!("{:064x}", index + 1),
-            })
-            .collect::<Vec<_>>();
+        let fixture = root.join("fixture");
+        fs::create_dir_all(&fixture).unwrap();
+        for index in 0..600 {
+            fs::write(
+                fixture.join(format!("file-{index}.bin")),
+                vec![index as u8; index + 1],
+            )
+            .unwrap();
+        }
+        let profile = ChunkProfile {
+            profile_id: "fixed-4m-sha256-aead".to_string(),
+            piece_size: crate::swarm::DEFAULT_PIECE_SIZE,
+            max_in_flight_pieces: 8,
+            hash: "sha256".to_string(),
+            aead: "x25519-hkdf-sha256-chacha20poly1305".to_string(),
+        };
+        let snapshot = build_v2_snapshot(
+            &[TransferSource {
+                path: fixture.to_string_lossy().to_string(),
+                relative_path: Some("fixture".to_string()),
+            }],
+            &profile,
+        )
+        .unwrap();
+        let items = manifest_from_v2_snapshot(&snapshot);
         let (job, _) = create_v2_job(
             &identity,
             "metadata-chain",
@@ -4169,7 +4433,7 @@ mod tests {
             &signing_key,
         )
         .unwrap();
-        let pages = build_v2_metadata_pages(&job.job_id, &items).unwrap();
+        let pages = build_v2_metadata_pages(&job.job_id, &snapshot).unwrap();
         assert!(pages.len() > 1);
         assert!(pages.len() <= MAX_V2_METADATA_PAGES);
         assert!(pages.iter().all(|page| {
@@ -4191,6 +4455,105 @@ mod tests {
 
     #[cfg(feature = "swarm-v2")]
     #[test]
+    fn secure_v2_object_retrieval_authorization_and_tampering() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-object-retrieval-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source.bin");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            &source,
+            vec![0x7au8; crate::swarm::DEFAULT_PIECE_SIZE as usize + 31],
+        )
+        .unwrap();
+        let profile = ChunkProfile {
+            profile_id: "fixed-4m-sha256-aead".to_string(),
+            piece_size: crate::swarm::DEFAULT_PIECE_SIZE,
+            max_in_flight_pieces: 8,
+            hash: "sha256".to_string(),
+            aead: "x25519-hkdf-sha256-chacha20poly1305".to_string(),
+        };
+        let snapshot = build_v2_snapshot(
+            &[TransferSource {
+                path: source.to_string_lossy().to_string(),
+                relative_path: Some("shared/source.bin".to_string()),
+            }],
+            &profile,
+        )
+        .unwrap();
+        let metadata_objects = crate::snapshot::build_metadata_pages(&snapshot, 16 * 1024)
+            .unwrap()
+            .into_iter()
+            .flat_map(|page| page.objects)
+            .collect::<Vec<_>>();
+        let request = build_v2_object_request("object-job", &metadata_objects).unwrap();
+        assert!(request
+            .objects
+            .iter()
+            .any(|object| object.kind == "directory"));
+        assert!(request
+            .objects
+            .iter()
+            .any(|object| object.kind == "piece-index"));
+        let response = build_v2_object_response(&request, &snapshot).unwrap();
+        validate_v2_object_response(&response, &request).unwrap();
+
+        let mut wrong_job = response.clone();
+        wrong_job.job_id = "other-job".to_string();
+        assert!(validate_v2_object_response(&wrong_job, &request).is_err());
+
+        let mut bad_base64 = response.clone();
+        bad_base64.objects[0].data = "not-base64".to_string();
+        assert!(validate_v2_object_response(&bad_base64, &request).is_err());
+
+        let mut duplicate_response = response.clone();
+        duplicate_response.objects[1] = duplicate_response.objects[0].clone();
+        assert!(validate_v2_object_response(&duplicate_response, &request).is_err());
+
+        let mut bad_response_length = response.clone();
+        bad_response_length.objects[0].reference.byte_len += 1;
+        assert!(validate_v2_object_response(&bad_response_length, &request).is_err());
+
+        let mut bad_content = response.clone();
+        let mut content = URL_SAFE_NO_PAD
+            .decode(&bad_content.objects[0].data)
+            .unwrap();
+        content[0] ^= 1;
+        bad_content.objects[0].data = URL_SAFE_NO_PAD.encode(content);
+        assert!(validate_v2_object_response(&bad_content, &request).is_err());
+
+        let mut bad_length_request = request.clone();
+        bad_length_request.objects[0].byte_len += 1;
+        assert!(build_v2_object_response(&bad_length_request, &snapshot).is_err());
+
+        let file = snapshot.files.first().unwrap();
+        let file_request = V2DirectObjectRequest {
+            kind: V2_DIRECT_OBJECT_REQUEST_KIND.to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: "object-job".to_string(),
+            objects: vec![crate::snapshot::SnapshotObjectRef {
+                kind: "file".to_string(),
+                object_id: file.object_id.clone(),
+                byte_len: serde_json::to_vec(file).unwrap().len() as u64,
+            }],
+        };
+        assert!(build_v2_object_response(&file_request, &snapshot).is_err());
+
+        let mut duplicate_request = request.clone();
+        duplicate_request.objects.push(request.objects[0].clone());
+        assert!(build_v2_object_response(&duplicate_request, &snapshot).is_err());
+        let too_many_objects = (0..=MAX_V2_OBJECTS_PER_REQUEST)
+            .map(|index| crate::snapshot::SnapshotObjectRef {
+                kind: "directory".to_string(),
+                object_id: format!("{:064x}", index + 1),
+                byte_len: 1,
+            })
+            .collect::<Vec<_>>();
+        assert!(build_v2_object_request("object-job", &too_many_objects).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "swarm-v2")]
+    #[test]
     fn secure_v2_offer_rejects_preapproval_key_envelope() {
         let root = std::env::temp_dir().join(format!("zapdrop-v2-offer-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -4205,6 +4568,8 @@ mod tests {
             kind: "file".to_string(),
             size: 1,
             sha256: digest_bytes(b"x"),
+            object_id: None,
+            object_byte_len: None,
         };
         let (job, job_key) = create_v2_job(
             &sender,
@@ -4274,6 +4639,8 @@ mod tests {
             kind: "file".to_string(),
             size: 1,
             sha256: digest_bytes(b"x"),
+            object_id: None,
+            object_byte_len: None,
         };
         let (job, _) = create_v2_job(
             &sender,

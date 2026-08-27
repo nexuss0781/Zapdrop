@@ -140,7 +140,11 @@ The snapshot engine now produces a reuse plan requiring both generation and cont
 
 ### Phase 16 — Authenticated network object retrieval and snapshot integration
 
-Integrate directory and piece-index object retrieval into the authenticated v2 metadata session, qualify source-mutation revisions and cross-snapshot reuse over the network, and keep the 4 GiB-plus physical-file requirement as a separately recorded hardware gate.
+**State:** Complete in this revision; physical-LAN, Windows runtime, process-restart, and broader snapshot gates remain open.
+
+The experimental v2 direct path now binds file-object IDs and serialized lengths into the signed manifest, advertises full typed snapshot metadata, and performs a bounded authenticated directory/piece-index object request and response after receiver approval and job-key provisioning but before ready/payload frames. Sender authorization is restricted to the freshly built `SnapshotObjectCatalog`; raw file-object requests, unlisted objects, duplicate references, length mismatches, malformed payloads, and content-derived ID mismatches fail closed.
+
+**Exit evidence:** Full qualification passes with 60 desktop tests, 2 companion tests, frontend build, formatting, shell checks, security gate, and the Phase 16 directory-source loopback plus authorization/tamper tests. See `docs/ZAPDROP_PHASE16_OBJECT_RETRIEVAL.md`.
 
 ### Phase 17 — Phase 9 direct-only topology integration
 
@@ -168,4 +172,4 @@ Run the full automated gate, build Windows artifacts, perform the physical-LAN m
 
 ## Immediate next move
 
-Phase 15 is complete in this revision. The next implementation action is **Phase 16 only**: implement authenticated network directory and piece-index object retrieval. No tree/mesh, repair, companion, or release work will be started in the same phase. Phase 16 must be tested, documented, committed, and pushed before the next phase begins.
+Phase 16 is complete in this revision. The next implementation action is **Phase 17 only**: direct-only tree/mesh topology integration behind an explicit feature flag. No repair, companion, or release work will be started in the same phase. Phase 17 must be implemented, tested, documented, committed, and pushed before the next phase begins.
