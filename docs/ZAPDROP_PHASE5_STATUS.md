@@ -1,6 +1,6 @@
 # Zapdrop Phase 5 Status
 
-**Status:** Implemented; final commit and repository push in progress
+**Status:** Implemented and pushed; concurrent transfer CI verified
 **Project:** standalone `nexuss0781/Zapdrop` private repository
 **Phase:** native file explorer integration, transfer history, and advanced receive management
 
@@ -63,17 +63,18 @@ The receive directory remains user-configurable. Native folder selection is limi
 | Check | Result |
 |---|---|
 | `cargo fmt --check` | Passed after formatting the new modules and tests |
-| Rust unit tests | Passed: 13/13 |
+| Rust unit tests | Passed: 15/15 |
 | Explorer inspection and symlink rejection tests | Passed |
 | History persistence/update/clear test | Passed |
 | React/TypeScript production build | Passed |
 | Tauri native release build without installer bundling | Passed (`CARGO_BUILD_JOBS=2`; release binary generated) |
 | `git diff --check` | Passed |
 | Browser preview | Passed; native picker actions, receive review section, and history view rendered coherently |
+| Concurrent A-to-B/B-to-A transfer test | Passed on GitHub Actions run [33086473036](https://github.com/nexuss0781/Zapdrop/actions/runs/33086473036); both files and receive histories verified |
 | Two-PC LAN acceptance test | Not run in the headless sandbox |
 
 ## Known limitations and next phase
 
-The transport remains authenticated through signed identity material and trusted-peer binding, but Phase 5 does **not** claim TLS or payload encryption. A later security-hardening phase should add encrypted transport or document an equivalent protection model before production use on hostile local networks. Desktop OS notifications are represented by in-app events and the receive review panel; a notification plugin is not required for the Phase 5 acceptance path. The sandbox cannot validate multicast discovery, hotspot behavior, throughput, interruption/resume, or simultaneous transfers across two real PCs.
+The transport remains authenticated through signed identity material and trusted-peer binding, but Phase 5 does **not** claim TLS or payload encryption. A later security-hardening phase should add encrypted transport or document an equivalent protection model before production use on hostile local networks. Desktop OS notifications are represented by in-app events and the receive review panel; a notification plugin is not required for the Phase 5 acceptance path. The concurrent CI test uses two isolated protocol peers over the same runner’s loopback interface; it does not replace a real two-PC LAN, Wi-Fi hotspot, multicast, throughput, interruption/resume, or firewall acceptance test.
 
 The next phase should prioritize two-machine acceptance tests, encrypted transport hardening, a fuller native directory browser, and optional platform notification integration.
