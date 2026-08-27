@@ -1141,6 +1141,54 @@ mod tests {
     }
 
     #[test]
+    fn journal_process_termination_child() {
+        let Ok(path) = std::env::var("ZAPDROP_JOURNAL_CRASH_CHILD") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let mut journal =
+            TransferJournal::new("job-process".to_string(), "root-process".to_string());
+        journal.save_atomic(&path).unwrap();
+        fs::write(path.with_extension("tmp"), b"{in-flight-truncated").unwrap();
+        fs::write(path.with_extension("ready"), b"ready").unwrap();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn journal_survives_actual_worker_process_termination() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-journal-process-{}", uuid::Uuid::new_v4()));
+        let path = root.join("nested/journal.json");
+        let ready = path.with_extension("ready");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("snapshot::tests::journal_process_termination_child")
+            .arg("--nocapture")
+            .env("ZAPDROP_JOURNAL_CRASH_CHILD", &path)
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if ready.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "journal child did not reach crash point");
+        child.kill().unwrap();
+        let _ = child.wait();
+        let loaded = TransferJournal::load(&path).unwrap();
+        assert_eq!(loaded.job_id, "job-process");
+        assert_eq!(
+            fs::read(path.with_extension("tmp")).unwrap(),
+            b"{in-flight-truncated"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn journal_load_rejects_truncated_or_wrong_kind_records() {
         let root =
             std::env::temp_dir().join(format!("zapdrop-journal-invalid-{}", uuid::Uuid::new_v4()));

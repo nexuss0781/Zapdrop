@@ -25,7 +25,8 @@ for test_name in \
   persists_sparse_resume_ranges_for_large_file_fixture \
   metadata_page_roundtrip_rejects_invalid_exchange_data \
   journal_atomic_save_ignores_stale_temporary_artifacts \
-  journal_load_rejects_truncated_or_wrong_kind_records; do
+  journal_load_rejects_truncated_or_wrong_kind_records \
+  journal_survives_actual_worker_process_termination; do
   run_test "" "$test_name"
 done
 for test_name in \
@@ -37,5 +38,5 @@ for test_name in \
   run_test "swarm-v2" "$test_name"
 done
 
-printf '%s\n' 'Snapshot qualification passed: deterministic 512-file indexing, serialized metadata bounds, subtree reuse, sparse journal persistence, metadata-page exchange validation, stale-state reset, crash-artifact rejection, and v2 sparse-resume loopback passed in default and swarm-v2 builds.'
-printf '%s\n' 'This remains a controlled local fixture; it does not claim 4 GiB-plus physical-file or process-termination acceptance.'
+printf '%s\n' 'Snapshot qualification passed: deterministic 512-file indexing, serialized metadata bounds, subtree reuse, sparse journal persistence, metadata-page exchange validation, stale-state reset, crash-artifact rejection, actual process termination, and v2 sparse-resume loopback passed in default and swarm-v2 builds.'
+printf '%s\n' 'This remains a controlled local fixture; it does not claim receiver termination during active payload writes or 4 GiB-plus physical-file acceptance.'
