@@ -130,29 +130,37 @@ The experimental v2 sender now has a real throttled loopback cancellation test. 
 
 **Exit evidence:** Active cancellation, large missing-range splitting, metadata-chain, sparse-resume, and full qualification tests pass. See `docs/ZAPDROP_PHASE14_ACTIVE_INTERRUPTION.md`.
 
-### Phase 15 — Cross-snapshot object integration acceptance
+### Phase 15 — Local cross-snapshot reuse and object catalog
 
-Qualify receiver restart during an active payload write, subtree reuse across independent network snapshots, directory and piece-index object retrieval, explicit source-mutation revisions, and the 4 GiB-plus physical-file requirement as a separately recorded hardware gate.
+**State:** Complete in this revision; network object retrieval and broader physical gates remain open.
 
-### Phase 16 — Phase 9 direct-only topology integration
+The snapshot engine now produces a reuse plan requiring both generation and content-derived subtree object-ID agreement, and a typed catalog provides bounded lookup for directory, file, and piece-index objects. A changed file is not reused merely because its containing directory timestamp is unchanged.
+
+**Exit evidence:** Independent snapshot tests pass for unchanged subtree reuse, changed subtree exclusion, and directory/file/piece-index catalog lookup. See `docs/ZAPDROP_PHASE15_CROSS_SNAPSHOT.md`.
+
+### Phase 16 — Authenticated network object retrieval and snapshot integration
+
+Integrate directory and piece-index object retrieval into the authenticated v2 metadata session, qualify source-mutation revisions and cross-snapshot reuse over the network, and keep the 4 GiB-plus physical-file requirement as a separately recorded hardware gate.
+
+### Phase 17 — Phase 9 direct-only topology integration
 
 Only after the direct path and authorization gates are stable, implement the least-privilege tree/mesh data plane behind an explicit feature flag. Enforce signed job scope, relay consent, object allow-lists, byte budgets, expiry, revocation, and direct fallback. Do not enable arbitrary forwarding.
 
 **Exit evidence:** Multi-process tests demonstrate that unauthorized relays cannot receive or forward unrelated content, and direct fallback remains functional.
 
-### Phase 17 — Phase 10 repair integration
+### Phase 18 — Phase 10 repair integration
 
 Evaluate repair coding against measured loss conditions, then integrate only a bounded encrypted repair path if it improves completion time or source amplification without unacceptable CPU/memory cost. Keep systematic direct transfer as the reference path.
 
 **Exit evidence:** Loss-injection benchmark, resource measurements, protocol tests, and an explicit decision to enable or defer repair.
 
-### Phase 18 — Phase 11 companion runtime boundary
+### Phase 19 — Phase 11 companion runtime boundary
 
 Implement the companion’s authenticated pairing, receive approval, send/receive operations, snapshot/piece/journal compatibility, and version negotiation only for platforms that can be built and tested honestly. If legacy Windows runtime support cannot be qualified, publish a clear supported-platform boundary instead of claiming compatibility.
 
 **Exit evidence:** Modern desktop and companion exchange content in a reproducible test, or the unsupported-platform boundary is documented and enforced.
 
-### Phase 19 — Final Windows release and physical qualification
+### Phase 20 — Final Windows release and physical qualification
 
 Run the full automated gate, build Windows artifacts, perform the physical-LAN matrix, record privacy and firewall behavior, publish compatibility and known limitations, and package only artifacts whose signing and runtime status are explicit.
 
@@ -160,4 +168,4 @@ Run the full automated gate, build Windows artifacts, perform the physical-LAN m
 
 ## Immediate next move
 
-Phase 14 is complete in this revision. The next implementation action is **Phase 15 only**: qualify cross-snapshot object integration. No tree/mesh, repair, companion, or release work will be started in the same phase. Phase 15 must be tested, documented, committed, and pushed before the next phase begins.
+Phase 15 is complete in this revision. The next implementation action is **Phase 16 only**: implement authenticated network directory and piece-index object retrieval. No tree/mesh, repair, companion, or release work will be started in the same phase. Phase 16 must be tested, documented, committed, and pushed before the next phase begins.

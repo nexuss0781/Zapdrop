@@ -193,6 +193,78 @@ impl SubtreeReuseIndex {
             .get(relative_path)
             .filter(|entry| entry.modified_at_nanos == modified_at_nanos)
     }
+
+    pub fn reuse_plan(&self, snapshot: &SnapshotBuildResult) -> Vec<SubtreeCacheEntry> {
+        snapshot
+            .subtree_cache
+            .iter()
+            .filter_map(|entry| {
+                self.reusable(&entry.relative_path, entry.modified_at_nanos)
+                    .filter(|cached| cached.object_id == entry.object_id)
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotObjectCatalog {
+    objects: HashMap<(String, String), SnapshotObjectRef>,
+}
+
+impl SnapshotObjectCatalog {
+    pub fn from_snapshot(snapshot: &SnapshotBuildResult) -> Self {
+        let mut objects = HashMap::new();
+        for directory in &snapshot.directories {
+            objects.insert(
+                ("directory".to_string(), directory.object_id.clone()),
+                SnapshotObjectRef {
+                    kind: "directory".to_string(),
+                    object_id: directory.object_id.clone(),
+                    byte_len: serde_json::to_vec(directory)
+                        .map(|bytes| bytes.len() as u64)
+                        .unwrap_or(0),
+                },
+            );
+        }
+        for file in &snapshot.files {
+            objects.insert(
+                ("file".to_string(), file.object_id.clone()),
+                SnapshotObjectRef {
+                    kind: "file".to_string(),
+                    object_id: file.object_id.clone(),
+                    byte_len: serde_json::to_vec(file)
+                        .map(|bytes| bytes.len() as u64)
+                        .unwrap_or(0),
+                },
+            );
+        }
+        for page in &snapshot.piece_pages {
+            objects.insert(
+                ("piece-index".to_string(), page.page_id.clone()),
+                SnapshotObjectRef {
+                    kind: "piece-index".to_string(),
+                    object_id: page.page_id.clone(),
+                    byte_len: serde_json::to_vec(page)
+                        .map(|bytes| bytes.len() as u64)
+                        .unwrap_or(0),
+                },
+            );
+        }
+        Self { objects }
+    }
+
+    pub fn get(&self, kind: &str, object_id: &str) -> Option<&SnapshotObjectRef> {
+        self.objects.get(&(kind.to_string(), object_id.to_string()))
+    }
+
+    pub fn len(&self) -> usize {
+        self.objects.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
 }
 
 pub fn build_metadata_pages(
@@ -1007,6 +1079,58 @@ mod tests {
                 .object_id,
             subtree.object_id
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cross_snapshot_reuse_and_object_catalog_are_bounded() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-cross-snapshot-{}", uuid::Uuid::new_v4()));
+        let fixture = root.join("fixture");
+        fs::create_dir_all(fixture.join("dir-00")).unwrap();
+        fs::create_dir_all(fixture.join("dir-01")).unwrap();
+        fs::write(fixture.join("dir-00/stable.bin"), vec![1u8; 1024]).unwrap();
+        fs::write(fixture.join("dir-01/changed.bin"), vec![2u8; 1024]).unwrap();
+        let first = build_snapshot(
+            &[SnapshotSource {
+                path: fixture.clone(),
+                relative_path: "fixture".to_string(),
+            }],
+            &SnapshotOptions::default(),
+        )
+        .unwrap();
+        let catalog = SnapshotObjectCatalog::from_snapshot(&first);
+        assert!(!catalog.is_empty());
+        assert!(catalog.get("directory", &first.root.root_id).is_some());
+        let stable_file = first
+            .files
+            .iter()
+            .find(|file| file.relative_path.ends_with("stable.bin"))
+            .unwrap();
+        assert!(catalog.get("file", &stable_file.object_id).is_some());
+        assert!(first
+            .piece_pages
+            .iter()
+            .all(|page| catalog.get("piece-index", &page.page_id).is_some()));
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(fixture.join("dir-01/changed.bin"), vec![3u8; 1024]).unwrap();
+        let second = build_snapshot(
+            &[SnapshotSource {
+                path: fixture.clone(),
+                relative_path: "fixture".to_string(),
+            }],
+            &SnapshotOptions::default(),
+        )
+        .unwrap();
+        let reuse = SubtreeReuseIndex::from_snapshot(&first).reuse_plan(&second);
+        assert!(reuse
+            .iter()
+            .any(|entry| entry.relative_path == "fixture/dir-00"));
+        assert!(!reuse
+            .iter()
+            .any(|entry| entry.relative_path == "fixture/dir-01"));
+        assert_ne!(first.root.root_id, second.root.root_id);
         fs::remove_dir_all(root).unwrap();
     }
 

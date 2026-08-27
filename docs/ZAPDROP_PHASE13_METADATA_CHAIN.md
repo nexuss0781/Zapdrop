@@ -21,4 +21,4 @@ The packing target is 16 KiB per metadata payload, while the existing encrypted 
 
 ## Honest boundary
 
-This is a bounded metadata-chain transport, not a complete content-addressed tree exchange. Directory and piece-index object retrieval, subtree reuse across independent network snapshots, active-transfer interruption handling, and 4 GiB-plus physical-PC acceptance remain open. `swarm-v2` remains feature-gated and experimental; v1 remains the default.
+This is a bounded metadata-chain transport, not a complete content-addressed tree exchange. Local cross-snapshot reuse decisions and a typed object catalog are now qualified separately, but authenticated network directory and piece-index object retrieval, active-transfer interruption handling, and 4 GiB-plus physical-PC acceptance remain open. `swarm-v2` remains feature-gated and experimental; v1 remains the default.
