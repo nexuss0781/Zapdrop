@@ -1,19 +1,47 @@
 #[cfg(feature = "swarm-tree-mesh")]
-use crate::secure::{EncryptedFrame, SecureChannel, SecureError};
+use crate::secure::{
+    establish_channel, ChannelRole, EncryptedFrame, SecureChannel, SecureError, SecureHandshake,
+};
 use crate::swarm::{
     CapabilityOperation, SwarmJob, SwarmValidationError, MAX_SWARM_OBJECTS, MAX_SWARM_RECIPIENTS,
     SWARM_PROTOCOL_VERSION,
 };
 #[cfg(feature = "swarm-tree-mesh")]
-use crate::swarm::{EncryptedPieceHeader, MAX_PIECE_SIZE};
+use crate::swarm::{EncryptedPieceHeader, MAX_CONTROL_FRAME_BYTES, MAX_PIECE_SIZE};
 #[cfg(feature = "swarm-tree-mesh")]
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use crate::{
+    discovery::PeerRecord,
+    identity::DeviceIdentity,
+    pairing::{read_json_line, write_json_line},
+    settings::SettingsStore,
+    trust::TrustedPeerStore,
+};
+#[cfg(feature = "swarm-tree-mesh")]
+use base64::{
+    engine::general_purpose::{STANDARD as STANDARD_B64, URL_SAFE_NO_PAD},
+    Engine as _,
+};
+#[cfg(feature = "swarm-tree-mesh")]
+use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "swarm-tree-mesh")]
 use sha2::{Digest, Sha256};
 #[cfg(feature = "swarm-tree-mesh")]
 use std::collections::HashMap;
 use std::collections::HashSet;
+#[cfg(feature = "swarm-tree-mesh")]
+use std::io::{self, BufRead, BufReader, Write};
+#[cfg(feature = "swarm-tree-mesh")]
+use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(feature = "swarm-tree-mesh")]
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
+#[cfg(feature = "swarm-tree-mesh")]
+use std::thread::{self, JoinHandle};
+#[cfg(feature = "swarm-tree-mesh")]
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_BRANCH_CHILDREN: usize = 8;
@@ -33,6 +61,16 @@ const RELAY_CONNECTION_REQUEST_AAD: &[u8] = b"zapdrop/swarm/v2/tree-mesh/relay-c
 #[cfg(feature = "swarm-tree-mesh")]
 const RELAY_CONNECTION_RESPONSE_AAD: &[u8] =
     b"zapdrop/swarm/v2/tree-mesh/relay-connection-response";
+#[cfg(feature = "swarm-tree-mesh")]
+const RELAY_SESSION_OPEN_AAD: &[u8] = b"zapdrop/swarm/v2/tree-mesh/relay-session-open";
+#[cfg(feature = "swarm-tree-mesh")]
+const RELAY_PIECE_AAD: &[u8] = b"zapdrop/swarm/v2/tree-mesh/relay-piece";
+#[cfg(feature = "swarm-tree-mesh")]
+const MAX_RELAY_SESSION_FRAME_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(feature = "swarm-tree-mesh")]
+const MAX_RELAY_LINE_BYTES: usize = 64 * 1024;
+#[cfg(feature = "swarm-tree-mesh")]
+const MAX_RELAY_ACTIVE_SESSIONS: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -259,6 +297,11 @@ fn seal_wire_json<T: Serialize>(
 ) -> Result<EncryptedFrame, SecureError> {
     let plaintext = serde_json::to_vec(value)
         .map_err(|error| SecureError::Invalid(format!("wire serialization: {error}")))?;
+    if plaintext.len() > MAX_CONTROL_FRAME_BYTES {
+        return Err(SecureError::Invalid(
+            "wire control frame too large".to_string(),
+        ));
+    }
     channel.seal(&plaintext, aad)
 }
 
@@ -269,6 +312,11 @@ fn open_wire_json<T: for<'de> Deserialize<'de>>(
     aad: &[u8],
 ) -> Result<T, SecureError> {
     let plaintext = channel.open(frame, aad)?;
+    if plaintext.len() > MAX_CONTROL_FRAME_BYTES {
+        return Err(SecureError::Invalid(
+            "wire control frame too large".to_string(),
+        ));
+    }
     serde_json::from_slice(&plaintext)
         .map_err(|error| SecureError::Invalid(format!("wire deserialization: {error}")))
 }
@@ -319,6 +367,518 @@ pub fn open_relay_connection_response(
     frame: &EncryptedFrame,
 ) -> Result<RelayConnectionResponse, SecureError> {
     open_wire_json(channel, frame, RELAY_CONNECTION_RESPONSE_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelaySessionOpen {
+    pub kind: String,
+    pub version: u32,
+    pub job: SwarmJob,
+    pub grant: RelayGrant,
+    pub assignment: WireBranchAssignment,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl RelaySessionOpen {
+    pub fn validate_for(
+        &self,
+        expected_relay_id: &str,
+        trusted_sender_id: &str,
+        trusted_sender_public_key: &str,
+        trusted_sender_fingerprint: &str,
+        now: u64,
+    ) -> Result<(), SwarmValidationError> {
+        if self.kind != "zapdrop_relay_session_open"
+            || self.version != SWARM_PROTOCOL_VERSION
+            || self.job.sender_id != trusted_sender_id
+            || self.job.sender_public_key != trusted_sender_public_key
+            || self.job.sender_fingerprint != trusted_sender_fingerprint
+            || self.grant.relay_id != expected_relay_id
+        {
+            return Err(SwarmValidationError::Unauthorized(
+                "relay session identity".to_string(),
+            ));
+        }
+        self.job.validate_at(now)?;
+        self.grant.validate_for(&self.job, now)?;
+        self.assignment.validate_for(&self.job, &self.grant, now)
+    }
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn seal_relay_session_open(
+    channel: &mut SecureChannel,
+    open: &RelaySessionOpen,
+) -> Result<EncryptedFrame, SecureError> {
+    seal_wire_json(channel, open, RELAY_SESSION_OPEN_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn open_relay_session_open(
+    channel: &mut SecureChannel,
+    frame: &EncryptedFrame,
+) -> Result<RelaySessionOpen, SecureError> {
+    open_wire_json(channel, frame, RELAY_SESSION_OPEN_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn seal_relay_piece(
+    channel: &mut SecureChannel,
+    envelope: &RelayPieceEnvelope,
+) -> Result<EncryptedFrame, SecureError> {
+    let plaintext = serde_json::to_vec(envelope)
+        .map_err(|error| SecureError::Invalid(format!("relay piece serialization: {error}")))?;
+    if plaintext.is_empty() || plaintext.len() > MAX_RELAY_SESSION_FRAME_BYTES {
+        return Err(SecureError::Invalid(
+            "relay piece frame too large".to_string(),
+        ));
+    }
+    channel.seal(&plaintext, RELAY_PIECE_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn open_relay_piece(
+    channel: &mut SecureChannel,
+    frame: &EncryptedFrame,
+) -> Result<RelayPieceEnvelope, SecureError> {
+    let plaintext = channel.open(frame, RELAY_PIECE_AAD)?;
+    if plaintext.len() > MAX_RELAY_SESSION_FRAME_BYTES {
+        return Err(SecureError::Invalid(
+            "relay piece frame too large".to_string(),
+        ));
+    }
+    serde_json::from_slice(&plaintext)
+        .map_err(|error| SecureError::Invalid(format!("relay piece deserialization: {error}")))
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+fn relay_io(error: impl ToString) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+fn read_relay_line_from_reader<T: for<'de> Deserialize<'de>>(
+    reader: &mut impl BufRead,
+) -> io::Result<T> {
+    let mut line = Vec::with_capacity(8 * 1024);
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "relay line ended before newline",
+            ));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(consumed) > MAX_RELAY_LINE_BYTES {
+            return Err(relay_io("relay handshake line exceeds protocol limit"));
+        }
+        line.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return serde_json::from_slice(line.trim_ascii()).map_err(relay_io);
+        }
+    }
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+fn write_relay_frame<T: Serialize>(stream: &TcpStream, value: &T) -> io::Result<()> {
+    let payload = serde_json::to_vec(value).map_err(relay_io)?;
+    if payload.is_empty() || payload.len() > MAX_RELAY_SESSION_FRAME_BYTES {
+        return Err(relay_io("relay session frame exceeds protocol limit"));
+    }
+    let length = u32::try_from(payload.len()).map_err(relay_io)?;
+    let mut writer = stream.try_clone()?;
+    writer.write_all(&length.to_be_bytes())?;
+    writer.write_all(&payload)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+fn read_relay_frame<T: for<'de> Deserialize<'de>>(reader: &mut impl BufRead) -> io::Result<T> {
+    let mut length_bytes = [0u8; 4];
+    reader.read_exact(&mut length_bytes)?;
+    let length = u32::from_be_bytes(length_bytes) as usize;
+    if length == 0 || length > MAX_RELAY_SESSION_FRAME_BYTES {
+        return Err(relay_io("relay session frame exceeds protocol limit"));
+    }
+    let mut payload = vec![0u8; length];
+    reader.read_exact(&mut payload)?;
+    serde_json::from_slice(&payload).map_err(relay_io)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelaySessionSummary {
+    pub job_id: String,
+    pub relay_id: String,
+    pub child_id: String,
+    pub pieces_received: usize,
+    pub bytes_received: u64,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+fn trusted_peer_key(peer: &PeerRecord) -> io::Result<VerifyingKey> {
+    if !peer.trusted {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "relay peer is not trusted",
+        ));
+    }
+    let public_key = peer
+        .public_key
+        .as_deref()
+        .ok_or_else(|| relay_io("trusted relay public key is unavailable"))?;
+    let bytes = STANDARD_B64.decode(public_key).map_err(relay_io)?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| relay_io("trusted relay public key has invalid length"))?;
+    VerifyingKey::from_bytes(&bytes).map_err(relay_io)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+fn relay_handshake_initiator(
+    stream: &TcpStream,
+    identity: &DeviceIdentity,
+    store: &SettingsStore,
+    peer: &PeerRecord,
+    session_id: &str,
+) -> io::Result<(BufReader<TcpStream>, SecureChannel)> {
+    let peer_key = trusted_peer_key(peer)?;
+    let expected_fingerprint = peer
+        .fingerprint
+        .as_deref()
+        .ok_or_else(|| relay_io("trusted relay fingerprint is unavailable"))?;
+    let signing_key = identity.signing_key(store)?;
+    let (hello, ephemeral) = SecureHandshake::create(
+        &signing_key,
+        session_id.to_string(),
+        identity.device_id.clone(),
+        identity.fingerprint.clone(),
+    )
+    .map_err(relay_io)?;
+    write_json_line(stream, &hello)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let peer_hello: SecureHandshake = read_relay_line_from_reader(&mut reader)?;
+    let mut channel = establish_channel(
+        &ephemeral,
+        &hello,
+        &peer_hello,
+        &peer_key,
+        &peer.id,
+        expected_fingerprint,
+        ChannelRole::Initiator,
+    )
+    .map_err(relay_io)?;
+    let proof: EncryptedFrame = read_relay_line_from_reader(&mut reader)?;
+    if channel
+        .open(&proof, b"secure-handshake-confirmation")
+        .map_err(relay_io)?
+        != b"zapdrop-v2-secure-ready"
+    {
+        return Err(relay_io("relay secure handshake proof mismatch"));
+    }
+    Ok((reader, channel))
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn connect_relay_session(
+    identity: &DeviceIdentity,
+    store: &SettingsStore,
+    peer: &PeerRecord,
+    open: &RelaySessionOpen,
+) -> io::Result<RelayClientSession> {
+    let address: SocketAddr = peer.endpoint.parse().map_err(relay_io)?;
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(8))?;
+    stream.set_read_timeout(Some(Duration::from_secs(12)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(12)))?;
+    let (mut reader, mut channel) = relay_handshake_initiator(
+        &stream,
+        identity,
+        store,
+        peer,
+        &format!("relay-session:{}", open.job.job_id),
+    )?;
+    let open_frame = seal_relay_session_open(&mut channel, open).map_err(relay_io)?;
+    write_relay_frame(&stream, &open_frame)?;
+    let response_frame: EncryptedFrame = read_relay_frame(&mut reader)?;
+    let response =
+        open_relay_connection_response(&mut channel, &response_frame).map_err(relay_io)?;
+    response
+        .validate_for(&open.job, &open.assignment, epoch_seconds())
+        .map_err(relay_io)?;
+    if !response.accepted {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            response
+                .reason
+                .unwrap_or_else(|| "relay rejected connection".to_string()),
+        ));
+    }
+    Ok(RelayClientSession {
+        stream,
+        channel,
+        assignment: open.assignment.clone(),
+    })
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub struct RelayClientSession {
+    stream: TcpStream,
+    channel: SecureChannel,
+    assignment: WireBranchAssignment,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl RelayClientSession {
+    pub fn send_piece(&mut self, envelope: &RelayPieceEnvelope) -> io::Result<()> {
+        if envelope.header.job_id != self.assignment.job_id
+            || !self
+                .assignment
+                .allowed_object_ids
+                .iter()
+                .any(|object_id| object_id == &envelope.header.object_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "relay piece is outside branch assignment",
+            ));
+        }
+        let frame = seal_relay_piece(&mut self.channel, envelope).map_err(relay_io)?;
+        write_relay_frame(&self.stream, &frame)
+    }
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn dispatch_relay_session(
+    stream: TcpStream,
+    identity: DeviceIdentity,
+    store: SettingsStore,
+    trust: TrustedPeerStore,
+) -> io::Result<RelaySessionSummary> {
+    stream.set_read_timeout(Some(Duration::from_secs(12)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(12)))?;
+    let hello: SecureHandshake = read_json_line(&stream)?;
+    let trusted = trust
+        .list()
+        .into_iter()
+        .find(|peer| peer.peer_id == hello.device_id && peer.fingerprint == hello.fingerprint)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "relay sender is not trusted",
+            )
+        })?;
+    let peer_key = trusted_peer_key(&PeerRecord {
+        id: trusted.peer_id.clone(),
+        name: trusted.name.clone(),
+        platform: "trusted".to_string(),
+        fingerprint: Some(trusted.fingerprint.clone()),
+        public_key: Some(trusted.public_key.clone()),
+        endpoint: trusted.endpoint.clone(),
+        port: trusted
+            .endpoint
+            .parse::<SocketAddr>()
+            .map(|value| value.port())
+            .unwrap_or(0),
+        status: "trusted".to_string(),
+        discovered_via: "trusted-store".to_string(),
+        last_seen: trusted.last_seen,
+        trusted: true,
+    })?;
+    if URL_SAFE_NO_PAD.encode(peer_key.to_bytes()) != hello.public_key {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "relay sender public key does not match trusted identity",
+        ));
+    }
+    let signing_key = identity.signing_key(&store)?;
+    let (response, ephemeral) = SecureHandshake::create(
+        &signing_key,
+        hello.session_id.clone(),
+        identity.device_id.clone(),
+        identity.fingerprint.clone(),
+    )
+    .map_err(relay_io)?;
+    write_json_line(&stream, &response)?;
+    let mut channel = establish_channel(
+        &ephemeral,
+        &response,
+        &hello,
+        &peer_key,
+        &trusted.peer_id,
+        &trusted.fingerprint,
+        ChannelRole::Responder,
+    )
+    .map_err(relay_io)?;
+    let proof = channel
+        .seal(b"zapdrop-v2-secure-ready", b"secure-handshake-confirmation")
+        .map_err(relay_io)?;
+    write_json_line(&stream, &proof)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let open_frame: EncryptedFrame = read_relay_frame(&mut reader)?;
+    let open = open_relay_session_open(&mut channel, &open_frame).map_err(relay_io)?;
+    open.validate_for(
+        &identity.device_id,
+        &trusted.peer_id,
+        &URL_SAFE_NO_PAD.encode(peer_key.to_bytes()),
+        &trusted.fingerprint,
+        epoch_seconds(),
+    )
+    .map_err(relay_io)?;
+    let response = RelayConnectionResponse {
+        kind: "zapdrop_relay_connection_response".to_string(),
+        version: SWARM_PROTOCOL_VERSION,
+        job_id: open.job.job_id.clone(),
+        snapshot_root: open.job.snapshot_root.clone(),
+        relay_id: open.grant.relay_id.clone(),
+        child_id: open.assignment.child_id.clone(),
+        assignment_nonce: open.assignment.nonce.clone(),
+        accepted: true,
+        reason: None,
+    };
+    let response_frame =
+        seal_relay_connection_response(&mut channel, &response).map_err(relay_io)?;
+    write_relay_frame(&stream, &response_frame)?;
+    let mut relay_store =
+        RelayPieceStore::new(&open.job, &open.grant, epoch_seconds()).map_err(relay_io)?;
+    let mut pieces_received = 0usize;
+    let mut bytes_received = 0u64;
+    loop {
+        let frame: EncryptedFrame = match read_relay_frame(&mut reader) {
+            Ok(frame) => frame,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                break
+            }
+            Err(error) => return Err(error),
+        };
+        let envelope = open_relay_piece(&mut channel, &frame).map_err(relay_io)?;
+        if relay_store
+            .insert(
+                &open.job,
+                &open.grant,
+                &open.assignment.child_id,
+                envelope,
+                epoch_seconds(),
+            )
+            .map_err(relay_io)?
+        {
+            pieces_received += 1;
+            bytes_received = relay_store.bytes_used();
+        }
+    }
+    Ok(RelaySessionSummary {
+        job_id: open.job.job_id,
+        relay_id: open.grant.relay_id,
+        child_id: open.assignment.child_id,
+        pieces_received,
+        bytes_received,
+    })
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+struct RelaySessionGuard(Arc<AtomicUsize>);
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl Drop for RelaySessionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub struct RelayListener {
+    pub port: u16,
+    completed_sessions: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl RelayListener {
+    pub fn start(
+        listener: TcpListener,
+        identity: DeviceIdentity,
+        store: SettingsStore,
+        trust: TrustedPeerStore,
+    ) -> io::Result<Self> {
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let completed_sessions = Arc::new(AtomicUsize::new(0));
+        let worker_completed = Arc::clone(&completed_sessions);
+        let active = Arc::new(AtomicUsize::new(0));
+        let worker_active = Arc::clone(&active);
+        let worker = thread::Builder::new()
+            .name("zapdrop-tree-mesh-relay-listener".to_string())
+            .spawn(move || {
+                while !worker_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            if worker_active
+                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                                    (count < MAX_RELAY_ACTIVE_SESSIONS).then_some(count + 1)
+                                })
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            let identity = identity.clone();
+                            let store = store.clone();
+                            let trust = trust.clone();
+                            let active = Arc::clone(&worker_active);
+                            let completed = Arc::clone(&worker_completed);
+                            let _ = thread::Builder::new()
+                                .name("zapdrop-tree-mesh-relay-session".to_string())
+                                .spawn(move || {
+                                    let _guard = RelaySessionGuard(active);
+                                    match dispatch_relay_session(stream, identity, store, trust) {
+                                        Ok(_) => {
+                                            completed.fetch_add(1, Ordering::AcqRel);
+                                        }
+                                        Err(error) => {
+                                            eprintln!("tree/mesh relay session rejected: {error}");
+                                        }
+                                    }
+                                });
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        Err(_) => thread::sleep(Duration::from_millis(100)),
+                    }
+                }
+            })
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        Ok(Self {
+            port,
+            completed_sessions,
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn completed_sessions(&self) -> usize {
+        self.completed_sessions.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl Drop for RelayListener {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 #[cfg(feature = "swarm-tree-mesh")]
@@ -835,6 +1395,14 @@ pub fn epoch_seconds() -> u64 {
 mod tests {
     use super::*;
     use crate::swarm::{ChunkProfile, DistributionMode};
+    #[cfg(feature = "swarm-tree-mesh")]
+    use crate::{
+        identity::DeviceIdentity,
+        settings::SettingsStore,
+        trust::{TrustedPeer, TrustedPeerStore},
+    };
+    #[cfg(feature = "swarm-tree-mesh")]
+    use std::{thread, time::Duration};
 
     fn job(mode: DistributionMode) -> SwarmJob {
         SwarmJob {
@@ -1061,6 +1629,132 @@ mod tests {
         response.assignment_nonce = assignment.nonce.clone();
         response.child_id = "attacker".to_string();
         assert!(orchestrator.complete(&job, &response, 100).is_err());
+    }
+
+    #[cfg(feature = "swarm-tree-mesh")]
+    #[test]
+    fn feature_gated_live_relay_listener_dispatches_authenticated_session() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-live-relay-{}", uuid::Uuid::new_v4()));
+        let relay_store = SettingsStore::new(root.join("relay-data"));
+        let sender_store = SettingsStore::new(root.join("sender-data"));
+        let relay_identity = DeviceIdentity::load_or_create(&relay_store).unwrap();
+        let sender_identity = DeviceIdentity::load_or_create(&sender_store).unwrap();
+        let relay_trust = TrustedPeerStore::load(&relay_store).unwrap();
+        relay_trust
+            .upsert(TrustedPeer {
+                version: 1,
+                peer_id: sender_identity.device_id.clone(),
+                name: "Trusted Sender".to_string(),
+                public_key: sender_identity.public_key.clone(),
+                fingerprint: sender_identity.fingerprint.clone(),
+                first_seen: 1,
+                last_seen: 1,
+                endpoint: "127.0.0.1:0".to_string(),
+            })
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let relay_listener =
+            RelayListener::start(listener, relay_identity.clone(), relay_store, relay_trust)
+                .unwrap();
+        let now = epoch_seconds();
+        let sender_public_key =
+            URL_SAFE_NO_PAD.encode(STANDARD_B64.decode(&sender_identity.public_key).unwrap());
+        let job = SwarmJob {
+            kind: "zapdrop_swarm_job".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: "live-relay-job".to_string(),
+            sender_id: sender_identity.device_id.clone(),
+            sender_public_key,
+
+            sender_fingerprint: sender_identity.fingerprint.clone(),
+            snapshot_root: "live-relay-root".to_string(),
+            recipient_ids: vec![relay_identity.device_id.clone(), "child".to_string()],
+            distribution_mode: DistributionMode::Tree,
+            chunk_profile: ChunkProfile::default(),
+            content_key_id: "live-relay-key".to_string(),
+            created_at: now.saturating_sub(1),
+            expires_at: now + 600,
+            signature: "sig".to_string(),
+        };
+        let grant = RelayGrant {
+            kind: "zapdrop_relay_grant".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: job.job_id.clone(),
+            snapshot_root: job.snapshot_root.clone(),
+            relay_id: relay_identity.device_id.clone(),
+            child_ids: vec!["child".to_string()],
+            allowed_object_ids: vec!["object-1".to_string()],
+            operations: vec![CapabilityOperation::ForwardPiece],
+            max_bytes: 1024,
+            expires_at: now + 300,
+            nonce: "live-grant".to_string(),
+            signature: "sig".to_string(),
+        };
+        let assignment = WireBranchAssignment {
+            kind: "zapdrop_branch_assignment".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: job.job_id.clone(),
+            snapshot_root: job.snapshot_root.clone(),
+            relay_id: relay_identity.device_id.clone(),
+            parent_id: sender_identity.device_id.clone(),
+            child_id: "child".to_string(),
+            allowed_object_ids: vec!["object-1".to_string()],
+            max_bytes: 1024,
+            expires_at: now + 200,
+            nonce: "live-assignment".to_string(),
+        };
+        let open = RelaySessionOpen {
+            kind: "zapdrop_relay_session_open".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job,
+            grant,
+            assignment,
+        };
+        let peer = PeerRecord {
+            id: relay_identity.device_id.clone(),
+            name: "Trusted Relay".to_string(),
+            platform: "windows".to_string(),
+            fingerprint: Some(relay_identity.fingerprint.clone()),
+            public_key: Some(relay_identity.public_key.clone()),
+            endpoint: endpoint.to_string(),
+            port: endpoint.port(),
+            status: "trusted".to_string(),
+            discovered_via: "loopback-test".to_string(),
+            last_seen: now,
+            trusted: true,
+        };
+        let mut client =
+            connect_relay_session(&sender_identity, &sender_store, &peer, &open).unwrap();
+        let job_key = crate::secure::JobKey::generate();
+        let (header, ciphertext) = crate::secure::seal_piece(
+            &job_key,
+            &open.job.job_id,
+            &open.job.snapshot_root,
+            "piece-1",
+            "object-1",
+            0,
+            0,
+            b"live relay",
+        )
+        .unwrap();
+        client
+            .send_piece(&RelayPieceEnvelope {
+                header,
+                ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
+            })
+            .unwrap();
+        drop(client);
+        for _ in 0..100 {
+            if relay_listener.completed_sessions() == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(relay_listener.completed_sessions(), 1);
+        drop(relay_listener);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(feature = "swarm-tree-mesh")]
