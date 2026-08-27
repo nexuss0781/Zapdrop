@@ -14,8 +14,8 @@ The implementation includes tests for canonical snapshots, Unicode normalization
 
 ## Network metadata contract slice
 
-The metadata-page type now exposes bounded validation for protocol kind, version, 64-character digest identifiers, allowed object kinds, and chained page links. Serialization round-trip tests reject malformed page IDs, object IDs, object kinds, and next-page links. The snapshot qualification runner exercises these checks in both default and `swarm-v2` builds.
+The metadata-page type exposes bounded validation for protocol kind, version, 64-character digest identifiers, allowed object kinds, and chained page links. The experimental v2 direct path now sends one authenticated, job-bound metadata page before the receiver offer; the receiver validates its content against the signed manifest before presenting approval. Serialization round-trip and mismatch tests reject malformed or unrelated metadata. The snapshot qualification runner exercises the validation checks in both default and `swarm-v2` builds.
 
-This is a validation and qualification contract only. Paged metadata is not yet exchanged on the network, and the v1 path remains the default. Network page transport, interruption after process termination, and 4 GiB-plus physical-file acceptance remain open follow-up work.
+This is the first bounded network metadata exchange, not a complete paged-tree protocol. Multiple page transport, subtree reuse across independent network snapshots, interruption after process termination, and 4 GiB-plus physical-file acceptance remain open follow-up work.
 
 The v1 path remains the default and is not switched to the Phase 7 engine. v2 remains feature-gated and opt-in pending the Phase 6 security and physical-LAN gates.

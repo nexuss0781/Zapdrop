@@ -51,6 +51,8 @@ const MAX_PENDING_TRANSFER_OFFERS: usize = 32;
 #[cfg(feature = "swarm-v2")]
 const V2_JOB_AAD: &[u8] = b"zapdrop/swarm/v2/direct-job";
 #[cfg(feature = "swarm-v2")]
+const V2_METADATA_AAD: &[u8] = b"zapdrop/swarm/v2/direct-metadata";
+#[cfg(feature = "swarm-v2")]
 const V2_PIECE_AAD: &[u8] = b"zapdrop/swarm/v2/direct-piece";
 #[cfg(feature = "swarm-v2")]
 const V2_COMPLETE_AAD: &[u8] = b"zapdrop/swarm/v2/direct-complete";
@@ -58,6 +60,8 @@ const V2_COMPLETE_AAD: &[u8] = b"zapdrop/swarm/v2/direct-complete";
 const V2_DIRECT_OFFER_KIND: &str = "zapdrop_swarm_direct_offer";
 #[cfg(feature = "swarm-v2")]
 const V2_DIRECT_DECISION_KIND: &str = "zapdrop_swarm_direct_decision";
+#[cfg(feature = "swarm-v2")]
+const V2_DIRECT_METADATA_KIND: &str = "zapdrop_swarm_direct_metadata_page";
 #[cfg(feature = "swarm-v2")]
 const V2_DIRECT_READY_KIND: &str = "zapdrop_swarm_direct_ready";
 #[cfg(feature = "swarm-v2")]
@@ -92,6 +96,16 @@ struct V2DirectKeyProvision {
     version: u32,
     job_id: String,
     key_envelope: crate::secure::JobKeyEnvelope,
+}
+
+#[cfg(feature = "swarm-v2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2DirectMetadataPage {
+    kind: String,
+    version: u32,
+    job_id: String,
+    page: crate::snapshot::SnapshotMetadataPage,
 }
 
 #[cfg(feature = "swarm-v2")]
@@ -1175,6 +1189,18 @@ pub fn handle_secure_incoming(
         Ok(clone) => BufReader::new(clone),
         Err(_) => return,
     };
+    let metadata_frame: EncryptedFrame = match read_v2_frame(&mut reader) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let metadata: V2DirectMetadataPage =
+        match open_v2_json(&mut channel, &metadata_frame, V2_METADATA_AAD) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = write_error(&stream, &error.to_string());
+                return;
+            }
+        };
     let frame: EncryptedFrame = match read_v2_frame(&mut reader) {
         Ok(value) => value,
         Err(_) => return,
@@ -1187,6 +1213,10 @@ pub fn handle_secure_incoming(
         }
     };
     if let Err(error) = validate_v2_direct_offer(&offer, &context, &trusted.peer_id, &peer_key) {
+        let _ = write_error(&stream, &error.to_string());
+        return;
+    }
+    if let Err(error) = validate_v2_metadata_page(&metadata, &offer.job, &offer.items) {
         let _ = write_error(&stream, &error.to_string());
         return;
     }
@@ -1397,6 +1427,67 @@ fn create_v2_job(
 }
 
 #[cfg(feature = "swarm-v2")]
+fn build_v2_metadata_page(
+    transfer_id: &str,
+    items: &[ManifestItem],
+) -> io::Result<V2DirectMetadataPage> {
+    let mut page = crate::snapshot::SnapshotMetadataPage {
+        kind: "zapdrop_snapshot_metadata_page".to_string(),
+        version: SWARM_PROTOCOL_VERSION,
+        page_id: "pending".to_string(),
+        objects: items
+            .iter()
+            .map(|item| crate::snapshot::SnapshotObjectRef {
+                kind: "file".to_string(),
+                object_id: item.sha256.clone(),
+                byte_len: item.size,
+            })
+            .collect(),
+        next_page: None,
+    };
+    page.page_id = digest_bytes(&serde_json::to_vec(&page).map_err(invalid)?);
+    page.validate()?;
+    Ok(V2DirectMetadataPage {
+        kind: V2_DIRECT_METADATA_KIND.to_string(),
+        version: SWARM_PROTOCOL_VERSION,
+        job_id: transfer_id.to_string(),
+        page,
+    })
+}
+
+#[cfg(feature = "swarm-v2")]
+fn validate_v2_metadata_page(
+    metadata: &V2DirectMetadataPage,
+    job: &SwarmJob,
+    items: &[ManifestItem],
+) -> io::Result<()> {
+    if metadata.kind != V2_DIRECT_METADATA_KIND
+        || metadata.version != SWARM_PROTOCOL_VERSION
+        || metadata.job_id != job.job_id
+    {
+        return Err(invalid("invalid v2 metadata page envelope"));
+    }
+    metadata.page.validate()?;
+    let mut expected = items
+        .iter()
+        .map(|item| (item.sha256.clone(), item.size))
+        .collect::<Vec<_>>();
+    let mut actual = metadata
+        .page
+        .objects
+        .iter()
+        .filter(|object| object.kind == "file")
+        .map(|object| (object.object_id.clone(), object.byte_len))
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    actual.sort_unstable();
+    if actual != expected {
+        return Err(invalid("v2 metadata page does not match manifest"));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "swarm-v2")]
 fn send_v2_direct(
     app: Option<&AppHandle>,
     manager: Option<&TransferManager>,
@@ -1474,6 +1565,11 @@ fn send_v2_direct(
         conflict_policy: policy.to_string(),
         key_envelope: None,
     };
+    let metadata = build_v2_metadata_page(&job.job_id, &manifest)?;
+    write_v2_frame(
+        &stream,
+        &seal_v2_json(&mut channel, &metadata, V2_METADATA_AAD)?,
+    )?;
     write_v2_frame(&stream, &seal_v2_json(&mut channel, &offer, V2_JOB_AAD)?)?;
     let decision_frame: EncryptedFrame = read_v2_frame(&mut reader)?;
     let decision: V2DirectDecision = open_v2_json(&mut channel, &decision_frame, V2_JOB_AAD)?;
