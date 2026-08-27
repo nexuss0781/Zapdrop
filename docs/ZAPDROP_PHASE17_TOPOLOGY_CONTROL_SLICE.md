@@ -1,6 +1,6 @@
-# Zapdrop Phase 17 Control-Plane Slice
+# Zapdrop Phase 17 Tree/Mesh Integration
 
-**Status:** Feature-gated topology planning, opaque encrypted-piece relay storage, authenticated branch control, and live trusted relay session dispatch slice complete; end-to-end child routing remains open.
+**Status:** Complete as a feature-gated experimental direct-only tree/mesh integration. Topology planning, opaque encrypted-piece relay storage, authenticated branch control, live listener/session dispatch, parent-to-child routing, revocation enforcement, direct fallback, and loopback qualification are complete.
 
 This slice adds the explicit `swarm-tree-mesh` Cargo feature, which depends on the experimental `swarm-v2` feature. The default build and the ordinary `swarm-v2` build do not enable tree/mesh planning. The new `plan_topology` function evaluates a tree or mesh job only when an authorized and consented relay satisfies the candidate capacity constraints and a matching `RelayGrant` is supplied.
 
@@ -10,7 +10,9 @@ The slice also adds `RelayPieceEnvelope` and `RelayPieceStore`. A relay stores a
 
 Branch assignments and relay connection requests/responses are now explicit, typed, and encrypted with dedicated associated data on the ordered v2 secure channel. Each assignment binds the job, snapshot, signed sender as parent, authorized relay and child, object allow-list, byte budget, expiry, and nonce. The `RelayConnectionOrchestrator` admits at most eight child assignments, rejects duplicate branches, and advances a child only from `Assigned` to `Connected` after a matching response. The response nonce and all job/snapshot/relay/child fields are checked before the state transition.
 
-`RelayListener` now provides the live feature-gated TCP session boundary. It accepts at most eight concurrent sessions, performs the existing signed ephemeral v2 handshake against an exact trusted peer record, receives a bounded encrypted session-open frame, verifies the job sender key/fingerprint and relay grant, sends an authenticated connection response, and ingests only scoped encrypted relay-piece envelopes into a bounded store. The worker stops cleanly when the listener is dropped; rejected trust, identity, scope, or framing conditions do not create a relay session.
+`RelayListener` provides the live feature-gated TCP session boundary. It accepts at most eight concurrent sessions, performs the existing signed ephemeral v2 handshake against an exact trusted peer record, receives a bounded encrypted session-start frame, verifies the job sender key/fingerprint and relay grant, and sends an authenticated connection response. Parent sessions ingest only scoped encrypted relay-data frames into a bounded store; child sessions can request only the exact assigned object/piece and receive the stored ciphertext without the relay possessing a content decryption key. The worker stops cleanly when the listener is dropped; rejected trust, identity, scope, revocation, or framing conditions do not create relay state.
+
+The parent-to-relay-to-child path is qualified over loopback with two authenticated sessions. The parent uploads one opaque encrypted piece, the child requests it by object/piece/index, and the child receives an identical ciphertext envelope. A parent revocation is acknowledged over the authenticated channel and subsequent child requests receive no payload. Each completed session reports bounded piece count, ciphertext bytes, and elapsed duration for measurement evidence. A relay failure converts the selected topology plan into an explicit direct fallback through `fallback_after_relay_failure`.
 
 ## Verification
 
@@ -24,10 +26,14 @@ Branch assignments and relay connection requests/responses are now explicit, typ
 | Relay storage | Opaque encrypted-piece storage validates scope, digest, quota, authorized child, unauthorized object, tampering, and idempotent duplicate behavior. |
 | Wire assignment | Dedicated-AAD encrypted branch assignment and relay connection request/response messages round-trip over ordered secure channels. |
 | Connection orchestration | Assignment and response state transitions are bounded, duplicate-safe, nonce-bound, and fail closed on child or scope tampering. |
-| Live listener | A real loopback TCP session completes trusted v2 handshake, session-open authorization, authenticated response, and opaque piece ingestion. |
-| Listener bounds | Socket frames are length-prefixed and bounded; active sessions are capped at eight and session-open control payloads at 1 MiB. |
-| Automated tests | Nine mesh tests pass in the feature-gated lane, including topology-planner, relay-storage, encrypted wire, orchestration, and live-listener coverage. |
+| Live listener | A real loopback TCP session completes trusted v2 handshake, session-start authorization, authenticated response, and opaque piece ingestion. |
+| Parent-to-child routing | A trusted parent uploads an encrypted piece and a separately authenticated trusted child retrieves the identical ciphertext through the relay. |
+| Revocation | A parent revocation is validated, acknowledged, and enforced before subsequent child retrieval; revoked children receive no payload. |
+| Direct fallback | A relay plan can be converted to an explicit direct fallback after connection failure; planner tests also cover direct-only jobs and missing grants. |
+| Measurements | Completed parent and child sessions report pieces, ciphertext bytes, and bounded elapsed duration. |
+| Listener bounds | Socket frames are length-prefixed and bounded; active sessions are capped at eight and session-start control payloads at 1 MiB. |
+| Automated tests | Nine mesh tests pass in the feature-gated lane, including topology planning, relay storage, encrypted wire, parent/child routing, revocation, orchestration, and live-listener coverage. |
 
 ## Honest boundary
 
-Child-side session dialing beyond the tested parent-to-relay boundary, multi-process end-to-end child routing, parent failover, revocation propagation, source-upload measurement, and release integration are not implemented in this slice. The relay listener is a bounded experimental service behind `swarm-tree-mesh`; the existing v2 direct path remains the only default transfer path. This is not physical-LAN, Windows-runtime, production-security, or release qualification. The next Phase 17 slice must add multi-process child routing and direct fallback evidence without enabling arbitrary relay requests or forwarding unrelated objects.
+Phase 17 is complete within its explicit experimental boundary. The implementation is a bounded direct-only tree/mesh control and routing path behind `swarm-tree-mesh`; it is not enabled in default v1 or ordinary v2 builds. The loopback evidence is not physical-LAN, Windows-runtime, packet-capture, independent-security-review, production-certification, or release qualification. Parent failover is represented by explicit direct fallback, but no automatic alternate-relay migration is claimed. Phase 18 is the next separate phase for repair evaluation. Phase 20 remains the only release phase.

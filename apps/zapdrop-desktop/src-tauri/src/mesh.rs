@@ -36,12 +36,12 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 #[cfg(feature = "swarm-tree-mesh")]
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 #[cfg(feature = "swarm-tree-mesh")]
 use std::thread::{self, JoinHandle};
 #[cfg(feature = "swarm-tree-mesh")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_BRANCH_CHILDREN: usize = 8;
@@ -64,7 +64,17 @@ const RELAY_CONNECTION_RESPONSE_AAD: &[u8] =
 #[cfg(feature = "swarm-tree-mesh")]
 const RELAY_SESSION_OPEN_AAD: &[u8] = b"zapdrop/swarm/v2/tree-mesh/relay-session-open";
 #[cfg(feature = "swarm-tree-mesh")]
+const RELAY_SESSION_START_AAD: &[u8] = b"zapdrop/swarm/v2/tree-mesh/relay-session-start";
+#[cfg(feature = "swarm-tree-mesh")]
 const RELAY_PIECE_AAD: &[u8] = b"zapdrop/swarm/v2/tree-mesh/relay-piece";
+#[cfg(feature = "swarm-tree-mesh")]
+const RELAY_SESSION_HEADER_AAD: &[u8] = b"zapdrop/swarm/v2/tree-mesh/relay-session-header";
+#[cfg(feature = "swarm-tree-mesh")]
+const RELAY_PIECE_REQUEST_AAD: &[u8] = b"zapdrop/swarm/v2/tree-mesh/relay-piece-request";
+#[cfg(feature = "swarm-tree-mesh")]
+const RELAY_PIECE_RESPONSE_AAD: &[u8] = b"zapdrop/swarm/v2/tree-mesh/relay-piece-response";
+#[cfg(feature = "swarm-tree-mesh")]
+const RELAY_DATA_AAD: &[u8] = b"zapdrop/swarm/v2/tree-mesh/relay-data";
 #[cfg(feature = "swarm-tree-mesh")]
 const MAX_RELAY_SESSION_FRAME_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(feature = "swarm-tree-mesh")]
@@ -242,6 +252,17 @@ pub enum TopologyPlan {
 }
 
 #[cfg(feature = "swarm-tree-mesh")]
+impl TopologyPlan {
+    pub fn fallback_after_relay_failure(self, reason: impl Into<String>) -> Self {
+        match self {
+            Self::Relay { .. } | Self::DirectFallback { .. } => Self::DirectFallback {
+                reason: format!("relay unavailable: {}", reason.into()),
+            },
+        }
+    }
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
 pub fn plan_topology(
     job: &SwarmJob,
     candidates: &[TopologyCandidate],
@@ -408,6 +429,69 @@ impl RelaySessionOpen {
 }
 
 #[cfg(feature = "swarm-tree-mesh")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelaySessionStart {
+    pub kind: String,
+    pub version: u32,
+    pub role: String,
+    pub open: Option<RelaySessionOpen>,
+    pub header: RelaySessionHeader,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl RelaySessionStart {
+    pub fn parent(open: &RelaySessionOpen) -> Self {
+        Self {
+            kind: "zapdrop_relay_session_start".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            role: "parent".to_string(),
+            open: Some(open.clone()),
+            header: RelaySessionHeader::parent(open),
+        }
+    }
+
+    pub fn child(assignment: &WireBranchAssignment) -> Self {
+        Self {
+            kind: "zapdrop_relay_session_start".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            role: "child".to_string(),
+            open: None,
+            header: RelaySessionHeader::child(assignment),
+        }
+    }
+
+    pub fn validate_basic(&self) -> Result<(), SwarmValidationError> {
+        if self.kind != "zapdrop_relay_session_start"
+            || self.version != SWARM_PROTOCOL_VERSION
+            || self.role != self.header.role
+            || (self.role == "parent") != self.open.is_some()
+        {
+            return Err(SwarmValidationError::InvalidValue(
+                "relay session start".to_string(),
+            ));
+        }
+        self.header.validate_basic()
+    }
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn seal_relay_session_start(
+    channel: &mut SecureChannel,
+    start: &RelaySessionStart,
+) -> Result<EncryptedFrame, SecureError> {
+    seal_wire_json(channel, start, RELAY_SESSION_START_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn open_relay_session_start(
+    channel: &mut SecureChannel,
+    frame: &EncryptedFrame,
+) -> Result<RelaySessionStart, SecureError> {
+    open_wire_json(channel, frame, RELAY_SESSION_START_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
 pub fn seal_relay_session_open(
     channel: &mut SecureChannel,
     open: &RelaySessionOpen,
@@ -451,6 +535,167 @@ pub fn open_relay_piece(
     }
     serde_json::from_slice(&plaintext)
         .map_err(|error| SecureError::Invalid(format!("relay piece deserialization: {error}")))
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelaySessionHeader {
+    pub kind: String,
+    pub version: u32,
+    pub role: String,
+    pub job_id: String,
+    pub snapshot_root: String,
+    pub relay_id: String,
+    pub parent_id: String,
+    pub child_id: String,
+    pub assignment_nonce: String,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl RelaySessionHeader {
+    pub fn parent(open: &RelaySessionOpen) -> Self {
+        Self {
+            kind: "zapdrop_relay_session_header".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            role: "parent".to_string(),
+            job_id: open.job.job_id.clone(),
+            snapshot_root: open.job.snapshot_root.clone(),
+            relay_id: open.assignment.relay_id.clone(),
+            parent_id: open.assignment.parent_id.clone(),
+            child_id: open.assignment.child_id.clone(),
+            assignment_nonce: open.assignment.nonce.clone(),
+        }
+    }
+
+    pub fn child(assignment: &WireBranchAssignment) -> Self {
+        Self {
+            kind: "zapdrop_relay_session_header".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            role: "child".to_string(),
+            job_id: assignment.job_id.clone(),
+            snapshot_root: assignment.snapshot_root.clone(),
+            relay_id: assignment.relay_id.clone(),
+            parent_id: assignment.parent_id.clone(),
+            child_id: assignment.child_id.clone(),
+            assignment_nonce: assignment.nonce.clone(),
+        }
+    }
+
+    pub fn validate_basic(&self) -> Result<(), SwarmValidationError> {
+        if self.kind != "zapdrop_relay_session_header"
+            || self.version != SWARM_PROTOCOL_VERSION
+            || !matches!(self.role.as_str(), "parent" | "child")
+            || self.job_id.is_empty()
+            || self.snapshot_root.is_empty()
+            || self.relay_id.is_empty()
+            || self.parent_id.is_empty()
+            || self.child_id.is_empty()
+            || self.assignment_nonce.is_empty()
+        {
+            return Err(SwarmValidationError::InvalidValue(
+                "relay session header".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn seal_relay_session_header(
+    channel: &mut SecureChannel,
+    header: &RelaySessionHeader,
+) -> Result<EncryptedFrame, SecureError> {
+    seal_wire_json(channel, header, RELAY_SESSION_HEADER_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn open_relay_session_header(
+    channel: &mut SecureChannel,
+    frame: &EncryptedFrame,
+) -> Result<RelaySessionHeader, SecureError> {
+    open_wire_json(channel, frame, RELAY_SESSION_HEADER_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayPieceRequest {
+    pub kind: String,
+    pub version: u32,
+    pub job_id: String,
+    pub object_id: String,
+    pub piece_id: String,
+    pub index: u64,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl RelayPieceRequest {
+    pub fn validate_for(
+        &self,
+        job: &SwarmJob,
+        assignment: &WireBranchAssignment,
+    ) -> Result<(), SwarmValidationError> {
+        if self.kind != "zapdrop_relay_piece_request"
+            || self.version != SWARM_PROTOCOL_VERSION
+            || self.job_id != job.job_id
+            || !assignment
+                .allowed_object_ids
+                .iter()
+                .any(|id| id == &self.object_id)
+            || self.object_id.is_empty()
+            || self.piece_id.is_empty()
+        {
+            return Err(SwarmValidationError::Unauthorized(
+                "relay piece request".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn seal_relay_piece_request(
+    channel: &mut SecureChannel,
+    request: &RelayPieceRequest,
+) -> Result<EncryptedFrame, SecureError> {
+    seal_wire_json(channel, request, RELAY_PIECE_REQUEST_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn open_relay_piece_request(
+    channel: &mut SecureChannel,
+    frame: &EncryptedFrame,
+) -> Result<RelayPieceRequest, SecureError> {
+    open_wire_json(channel, frame, RELAY_PIECE_REQUEST_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayPieceResponse {
+    pub kind: String,
+    pub version: u32,
+    pub job_id: String,
+    pub request: RelayPieceRequest,
+    pub envelope: Option<RelayPieceEnvelope>,
+    pub reason: Option<String>,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn seal_relay_piece_response(
+    channel: &mut SecureChannel,
+    response: &RelayPieceResponse,
+) -> Result<EncryptedFrame, SecureError> {
+    seal_wire_json(channel, response, RELAY_PIECE_RESPONSE_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn open_relay_piece_response(
+    channel: &mut SecureChannel,
+    frame: &EncryptedFrame,
+) -> Result<RelayPieceResponse, SecureError> {
+    open_wire_json(channel, frame, RELAY_PIECE_RESPONSE_AAD)
 }
 
 #[cfg(feature = "swarm-tree-mesh")]
@@ -517,6 +762,57 @@ pub struct RelaySessionSummary {
     pub child_id: String,
     pub pieces_received: usize,
     pub bytes_received: u64,
+    pub duration_ms: u64,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+struct RelayRoute {
+    job: SwarmJob,
+    grant: RelayGrant,
+    assignment: WireBranchAssignment,
+    store: RelayPieceStore,
+    revoked_peer_ids: HashSet<String>,
+    parent_connected: bool,
+    child_connected: bool,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+type SharedRelayRoutes = Arc<Mutex<HashMap<String, Arc<Mutex<RelayRoute>>>>>;
+
+#[cfg(feature = "swarm-tree-mesh")]
+fn validate_relay_envelope_for_child(
+    job: &SwarmJob,
+    assignment: &WireBranchAssignment,
+    envelope: &RelayPieceEnvelope,
+) -> io::Result<()> {
+    let header = &envelope.header;
+    if header.kind != "zapdrop_encrypted_piece"
+        || header.version != SWARM_PROTOCOL_VERSION
+        || header.job_id != job.job_id
+        || !assignment
+            .allowed_object_ids
+            .iter()
+            .any(|object_id| object_id == &header.object_id)
+    {
+        return Err(relay_io("relay child received an out-of-scope piece"));
+    }
+    header
+        .validate_against(&job.chunk_profile)
+        .map_err(relay_io)?;
+    let ciphertext = URL_SAFE_NO_PAD
+        .decode(&envelope.ciphertext)
+        .map_err(relay_io)?;
+    if ciphertext.len() as u64 != header.ciphertext_length {
+        return Err(relay_io("relay child received a piece length mismatch"));
+    }
+    let digest = Sha256::digest(&ciphertext)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if digest != header.ciphertext_sha256 {
+        return Err(relay_io("relay child received a piece digest mismatch"));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "swarm-tree-mesh")]
@@ -601,8 +897,10 @@ pub fn connect_relay_session(
         peer,
         &format!("relay-session:{}", open.job.job_id),
     )?;
-    let open_frame = seal_relay_session_open(&mut channel, open).map_err(relay_io)?;
-    write_relay_frame(&stream, &open_frame)?;
+    let start = RelaySessionStart::parent(open);
+    start.validate_basic().map_err(relay_io)?;
+    let start_frame = seal_relay_session_start(&mut channel, &start).map_err(relay_io)?;
+    write_relay_frame(&stream, &start_frame)?;
     let response_frame: EncryptedFrame = read_relay_frame(&mut reader)?;
     let response =
         open_relay_connection_response(&mut channel, &response_frame).map_err(relay_io)?;
@@ -619,7 +917,9 @@ pub fn connect_relay_session(
     }
     Ok(RelayClientSession {
         stream,
+        reader,
         channel,
+        job: open.job.clone(),
         assignment: open.assignment.clone(),
     })
 }
@@ -627,7 +927,9 @@ pub fn connect_relay_session(
 #[cfg(feature = "swarm-tree-mesh")]
 pub struct RelayClientSession {
     stream: TcpStream,
+    reader: BufReader<TcpStream>,
     channel: SecureChannel,
+    job: SwarmJob,
     assignment: WireBranchAssignment,
 }
 
@@ -646,18 +948,149 @@ impl RelayClientSession {
                 "relay piece is outside branch assignment",
             ));
         }
-        let frame = seal_relay_piece(&mut self.channel, envelope).map_err(relay_io)?;
+        let frame = seal_relay_data(&mut self.channel, &RelayDataFrame::piece(envelope.clone()))
+            .map_err(relay_io)?;
         write_relay_frame(&self.stream, &frame)
+    }
+
+    pub fn send_revocation(&mut self, revocation: &BranchRevocation) -> io::Result<()> {
+        if revocation.branch_root_id != self.assignment.child_id
+            || !revocation.is_revoked(&self.assignment.child_id)
+        {
+            return Err(relay_io("relay revocation is outside branch assignment"));
+        }
+        revocation
+            .validate(&self.job, epoch_seconds())
+            .map_err(relay_io)?;
+        let frame = seal_relay_data(
+            &mut self.channel,
+            &RelayDataFrame::revocation(revocation.clone()),
+        )
+        .map_err(relay_io)?;
+        write_relay_frame(&self.stream, &frame)?;
+        let response_frame: EncryptedFrame = read_relay_frame(&mut self.reader)?;
+        let response =
+            open_relay_connection_response(&mut self.channel, &response_frame).map_err(relay_io)?;
+        if response.kind != "zapdrop_relay_connection_response"
+            || response.version != SWARM_PROTOCOL_VERSION
+            || response.job_id != self.job.job_id
+            || response.snapshot_root != self.assignment.snapshot_root
+            || response.relay_id != self.assignment.relay_id
+            || response.child_id != self.assignment.child_id
+            || response.assignment_nonce != self.assignment.nonce
+            || response.accepted
+            || response.reason.as_deref() != Some("revocation-applied")
+        {
+            return Err(relay_io("relay revocation acknowledgement mismatch"));
+        }
+        Ok(())
     }
 }
 
 #[cfg(feature = "swarm-tree-mesh")]
-pub fn dispatch_relay_session(
+pub fn connect_relay_child_session(
+    identity: &DeviceIdentity,
+    store: &SettingsStore,
+    peer: &PeerRecord,
+    job: &SwarmJob,
+    assignment: &WireBranchAssignment,
+) -> io::Result<RelayChildSession> {
+    let address: SocketAddr = peer.endpoint.parse().map_err(relay_io)?;
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(8))?;
+    stream.set_read_timeout(Some(Duration::from_secs(12)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(12)))?;
+    let (mut reader, mut channel) = relay_handshake_initiator(
+        &stream,
+        identity,
+        store,
+        peer,
+        &format!("relay-child:{}:{}", job.job_id, assignment.child_id),
+    )?;
+    let start = RelaySessionStart::child(assignment);
+    start.validate_basic().map_err(relay_io)?;
+    let start_frame = seal_relay_session_start(&mut channel, &start).map_err(relay_io)?;
+    write_relay_frame(&stream, &start_frame)?;
+    let response_frame: EncryptedFrame = read_relay_frame(&mut reader)?;
+    let response =
+        open_relay_connection_response(&mut channel, &response_frame).map_err(relay_io)?;
+    response
+        .validate_for(job, assignment, epoch_seconds())
+        .map_err(relay_io)?;
+    if !response.accepted {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            response
+                .reason
+                .unwrap_or_else(|| "relay rejected child connection".to_string()),
+        ));
+    }
+    Ok(RelayChildSession {
+        stream,
+        reader,
+        channel,
+        job: job.clone(),
+        assignment: assignment.clone(),
+    })
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub struct RelayChildSession {
+    stream: TcpStream,
+    reader: BufReader<TcpStream>,
+    channel: SecureChannel,
+    job: SwarmJob,
+    assignment: WireBranchAssignment,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl RelayChildSession {
+    pub fn request_piece(
+        &mut self,
+        object_id: &str,
+        piece_id: &str,
+        index: u64,
+    ) -> io::Result<Option<RelayPieceEnvelope>> {
+        let request = RelayPieceRequest {
+            kind: "zapdrop_relay_piece_request".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: self.job.job_id.clone(),
+            object_id: object_id.to_string(),
+            piece_id: piece_id.to_string(),
+            index,
+        };
+        request
+            .validate_for(&self.job, &self.assignment)
+            .map_err(relay_io)?;
+        let frame = seal_relay_piece_request(&mut self.channel, &request).map_err(relay_io)?;
+        write_relay_frame(&self.stream, &frame)?;
+        let response_frame: EncryptedFrame = read_relay_frame(&mut self.reader)?;
+        let response =
+            open_relay_piece_response(&mut self.channel, &response_frame).map_err(relay_io)?;
+        if response.kind != "zapdrop_relay_piece_response"
+            || response.version != SWARM_PROTOCOL_VERSION
+            || response.job_id != request.job_id
+            || response.request != request
+        {
+            return Err(relay_io("relay piece response binding mismatch"));
+        }
+        if let Some(envelope) = &response.envelope {
+            validate_relay_envelope_for_child(&self.job, &self.assignment, envelope)?;
+        } else if response.reason.as_deref().unwrap_or_default().is_empty() {
+            return Err(relay_io("relay piece response lacks payload or reason"));
+        }
+        Ok(response.envelope)
+    }
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+fn dispatch_relay_session(
     stream: TcpStream,
     identity: DeviceIdentity,
     store: SettingsStore,
     trust: TrustedPeerStore,
+    routes: SharedRelayRoutes,
 ) -> io::Result<RelaySessionSummary> {
+    let started = Instant::now();
     stream.set_read_timeout(Some(Duration::from_secs(12)))?;
     stream.set_write_timeout(Some(Duration::from_secs(12)))?;
     let hello: SecureHandshake = read_json_line(&stream)?;
@@ -718,34 +1151,190 @@ pub fn dispatch_relay_session(
         .map_err(relay_io)?;
     write_json_line(&stream, &proof)?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let open_frame: EncryptedFrame = read_relay_frame(&mut reader)?;
-    let open = open_relay_session_open(&mut channel, &open_frame).map_err(relay_io)?;
-    open.validate_for(
-        &identity.device_id,
-        &trusted.peer_id,
-        &URL_SAFE_NO_PAD.encode(peer_key.to_bytes()),
-        &trusted.fingerprint,
-        epoch_seconds(),
-    )
-    .map_err(relay_io)?;
+    let start_frame: EncryptedFrame = read_relay_frame(&mut reader)?;
+    let start = open_relay_session_start(&mut channel, &start_frame).map_err(relay_io)?;
+    start.validate_basic().map_err(relay_io)?;
+    let now = epoch_seconds();
+    if start.role == "parent" {
+        let open = start
+            .open
+            .ok_or_else(|| relay_io("parent relay session lacks open scope"))?;
+        if start.header != RelaySessionHeader::parent(&open) {
+            return Err(relay_io("parent relay session header mismatch"));
+        }
+        open.validate_for(
+            &identity.device_id,
+            &trusted.peer_id,
+            &URL_SAFE_NO_PAD.encode(peer_key.to_bytes()),
+            &trusted.fingerprint,
+            now,
+        )
+        .map_err(relay_io)?;
+        let relay_store = RelayPieceStore::new(&open.job, &open.grant, now).map_err(relay_io)?;
+        let route = Arc::new(Mutex::new(RelayRoute {
+            job: open.job.clone(),
+            grant: open.grant.clone(),
+            assignment: open.assignment.clone(),
+            store: relay_store,
+            revoked_peer_ids: HashSet::new(),
+            parent_connected: true,
+            child_connected: false,
+        }));
+        {
+            let mut route_map = routes
+                .lock()
+                .map_err(|_| relay_io("relay route registry poisoned"))?;
+            route_map.retain(|_, value| {
+                value
+                    .lock()
+                    .map(|route| route.job.expires_at > now)
+                    .unwrap_or(false)
+            });
+            if route_map.len() >= MAX_RELAY_CONNECTIONS {
+                return Err(relay_io("relay route capacity reached"));
+            }
+            if route_map
+                .insert(open.assignment.nonce.clone(), Arc::clone(&route))
+                .is_some()
+            {
+                return Err(relay_io("duplicate relay route assignment"));
+            }
+        }
+        let response = RelayConnectionResponse {
+            kind: "zapdrop_relay_connection_response".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: open.job.job_id.clone(),
+            snapshot_root: open.job.snapshot_root.clone(),
+            relay_id: open.grant.relay_id.clone(),
+            child_id: open.assignment.child_id.clone(),
+            assignment_nonce: open.assignment.nonce.clone(),
+            accepted: true,
+            reason: None,
+        };
+        let response_frame =
+            seal_relay_connection_response(&mut channel, &response).map_err(relay_io)?;
+        write_relay_frame(&stream, &response_frame)?;
+        let mut pieces_received = 0usize;
+        loop {
+            let frame: EncryptedFrame = match read_relay_frame(&mut reader) {
+                Ok(frame) => frame,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    break
+                }
+                Err(error) => return Err(error),
+            };
+            let data = open_relay_data(&mut channel, &frame).map_err(relay_io)?;
+            let mut route_state = route.lock().map_err(|_| relay_io("relay route poisoned"))?;
+            if let Some(envelope) = data.piece {
+                let route_job = route_state.job.clone();
+                let route_grant = route_state.grant.clone();
+                let route_child_id = route_state.assignment.child_id.clone();
+                if route_state
+                    .store
+                    .insert(
+                        &route_job,
+                        &route_grant,
+                        &route_child_id,
+                        envelope,
+                        epoch_seconds(),
+                    )
+                    .map_err(relay_io)?
+                {
+                    pieces_received += 1;
+                }
+            } else if let Some(revocation) = data.revocation {
+                revocation
+                    .validate(&route_state.job, epoch_seconds())
+                    .map_err(relay_io)?;
+                if revocation.branch_root_id != route_state.assignment.child_id
+                    || revocation
+                        .revoked_peer_ids
+                        .iter()
+                        .any(|peer_id| !route_state.job.authorizes(peer_id))
+                {
+                    return Err(relay_io("relay revocation branch mismatch"));
+                }
+                route_state
+                    .revoked_peer_ids
+                    .extend(revocation.revoked_peer_ids);
+                let acknowledgement = RelayConnectionResponse {
+                    kind: "zapdrop_relay_connection_response".to_string(),
+                    version: SWARM_PROTOCOL_VERSION,
+                    job_id: route_state.job.job_id.clone(),
+                    snapshot_root: route_state.job.snapshot_root.clone(),
+                    relay_id: route_state.assignment.relay_id.clone(),
+                    child_id: route_state.assignment.child_id.clone(),
+                    assignment_nonce: route_state.assignment.nonce.clone(),
+                    accepted: false,
+                    reason: Some("revocation-applied".to_string()),
+                };
+                let acknowledgement_frame =
+                    seal_relay_connection_response(&mut channel, &acknowledgement)
+                        .map_err(relay_io)?;
+                write_relay_frame(&stream, &acknowledgement_frame)?;
+            }
+        }
+        let route_state = route.lock().map_err(|_| relay_io("relay route poisoned"))?;
+        let bytes_received = route_state.store.bytes_used();
+        drop(route_state);
+        if let Ok(mut route_state) = route.lock() {
+            route_state.parent_connected = false;
+        }
+        return Ok(RelaySessionSummary {
+            job_id: open.job.job_id,
+            relay_id: open.grant.relay_id,
+            child_id: open.assignment.child_id,
+            pieces_received,
+            bytes_received,
+            duration_ms: started.elapsed().as_millis() as u64,
+        });
+    }
+
+    let child_header = start.header;
+    let route = routes
+        .lock()
+        .map_err(|_| relay_io("relay route registry poisoned"))?
+        .get(&child_header.assignment_nonce)
+        .cloned()
+        .ok_or_else(|| relay_io("unknown or expired relay route"))?;
+    let mut route_state = route.lock().map_err(|_| relay_io("relay route poisoned"))?;
+    if child_header.role != "child"
+        || child_header.job_id != route_state.job.job_id
+        || child_header.snapshot_root != route_state.job.snapshot_root
+        || child_header.relay_id != identity.device_id
+        || child_header.parent_id != route_state.assignment.parent_id
+        || child_header.child_id != trusted.peer_id
+        || child_header.child_id != route_state.assignment.child_id
+        || route_state.child_connected
+        || route_state.revoked_peer_ids.contains(&trusted.peer_id)
+    {
+        return Err(relay_io(
+            "relay child session is outside its assigned branch",
+        ));
+    }
+    route_state.child_connected = true;
     let response = RelayConnectionResponse {
         kind: "zapdrop_relay_connection_response".to_string(),
         version: SWARM_PROTOCOL_VERSION,
-        job_id: open.job.job_id.clone(),
-        snapshot_root: open.job.snapshot_root.clone(),
-        relay_id: open.grant.relay_id.clone(),
-        child_id: open.assignment.child_id.clone(),
-        assignment_nonce: open.assignment.nonce.clone(),
+        job_id: route_state.job.job_id.clone(),
+        snapshot_root: route_state.job.snapshot_root.clone(),
+        relay_id: identity.device_id.clone(),
+        child_id: route_state.assignment.child_id.clone(),
+        assignment_nonce: route_state.assignment.nonce.clone(),
         accepted: true,
         reason: None,
     };
     let response_frame =
         seal_relay_connection_response(&mut channel, &response).map_err(relay_io)?;
     write_relay_frame(&stream, &response_frame)?;
-    let mut relay_store =
-        RelayPieceStore::new(&open.job, &open.grant, epoch_seconds()).map_err(relay_io)?;
-    let mut pieces_received = 0usize;
-    let mut bytes_received = 0u64;
+    drop(route_state);
+    let mut requests_served = 0usize;
+    let mut bytes_sent = 0u64;
     loop {
         let frame: EncryptedFrame = match read_relay_frame(&mut reader) {
             Ok(frame) => frame,
@@ -759,27 +1348,63 @@ pub fn dispatch_relay_session(
             }
             Err(error) => return Err(error),
         };
-        let envelope = open_relay_piece(&mut channel, &frame).map_err(relay_io)?;
-        if relay_store
-            .insert(
-                &open.job,
-                &open.grant,
-                &open.assignment.child_id,
-                envelope,
+        let request = open_relay_piece_request(&mut channel, &frame).map_err(relay_io)?;
+        let route_state = route.lock().map_err(|_| relay_io("relay route poisoned"))?;
+        if route_state.revoked_peer_ids.contains(&trusted.peer_id) {
+            let response = RelayPieceResponse {
+                kind: "zapdrop_relay_piece_response".to_string(),
+                version: SWARM_PROTOCOL_VERSION,
+                job_id: request.job_id.clone(),
+                request,
+                envelope: None,
+                reason: Some("relay child has been revoked".to_string()),
+            };
+            let response_frame =
+                seal_relay_piece_response(&mut channel, &response).map_err(relay_io)?;
+            write_relay_frame(&stream, &response_frame)?;
+            break;
+        }
+        request
+            .validate_for(&route_state.job, &route_state.assignment)
+            .map_err(relay_io)?;
+        let envelope = route_state
+            .store
+            .get_for_child(
+                &route_state.job,
+                &route_state.grant,
+                &route_state.assignment.child_id,
+                &request.object_id,
+                &request.piece_id,
+                request.index,
                 epoch_seconds(),
             )
-            .map_err(relay_io)?
-        {
-            pieces_received += 1;
-            bytes_received = relay_store.bytes_used();
+            .map_err(relay_io)?;
+        if let Some(envelope) = &envelope {
+            bytes_sent = bytes_sent.saturating_add(envelope.header.ciphertext_length);
+            requests_served += 1;
         }
+        let response = RelayPieceResponse {
+            kind: "zapdrop_relay_piece_response".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: request.job_id.clone(),
+            request,
+            envelope,
+            reason: None,
+        };
+        let response_frame =
+            seal_relay_piece_response(&mut channel, &response).map_err(relay_io)?;
+        write_relay_frame(&stream, &response_frame)?;
+    }
+    if let Ok(mut route_state) = route.lock() {
+        route_state.child_connected = false;
     }
     Ok(RelaySessionSummary {
-        job_id: open.job.job_id,
-        relay_id: open.grant.relay_id,
-        child_id: open.assignment.child_id,
-        pieces_received,
-        bytes_received,
+        job_id: child_header.job_id,
+        relay_id: child_header.relay_id,
+        child_id: child_header.child_id,
+        pieces_received: requests_served,
+        bytes_received: bytes_sent,
+        duration_ms: started.elapsed().as_millis() as u64,
     })
 }
 
@@ -797,6 +1422,7 @@ impl Drop for RelaySessionGuard {
 pub struct RelayListener {
     pub port: u16,
     completed_sessions: Arc<AtomicUsize>,
+    measurements: Arc<Mutex<Vec<RelaySessionSummary>>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -815,6 +1441,10 @@ impl RelayListener {
         let worker_stop = Arc::clone(&stop);
         let completed_sessions = Arc::new(AtomicUsize::new(0));
         let worker_completed = Arc::clone(&completed_sessions);
+        let measurements = Arc::new(Mutex::new(Vec::new()));
+        let worker_measurements = Arc::clone(&measurements);
+        let routes: SharedRelayRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let worker_routes = Arc::clone(&routes);
         let active = Arc::new(AtomicUsize::new(0));
         let worker_active = Arc::clone(&active);
         let worker = thread::Builder::new()
@@ -836,12 +1466,19 @@ impl RelayListener {
                             let trust = trust.clone();
                             let active = Arc::clone(&worker_active);
                             let completed = Arc::clone(&worker_completed);
+                            let measurements = Arc::clone(&worker_measurements);
+                            let routes = Arc::clone(&worker_routes);
                             let _ = thread::Builder::new()
                                 .name("zapdrop-tree-mesh-relay-session".to_string())
                                 .spawn(move || {
                                     let _guard = RelaySessionGuard(active);
-                                    match dispatch_relay_session(stream, identity, store, trust) {
-                                        Ok(_) => {
+                                    match dispatch_relay_session(
+                                        stream, identity, store, trust, routes,
+                                    ) {
+                                        Ok(summary) => {
+                                            if let Ok(mut values) = measurements.lock() {
+                                                values.push(summary);
+                                            }
                                             completed.fetch_add(1, Ordering::AcqRel);
                                         }
                                         Err(error) => {
@@ -861,6 +1498,7 @@ impl RelayListener {
         Ok(Self {
             port,
             completed_sessions,
+            measurements,
             stop,
             worker: Some(worker),
         })
@@ -868,6 +1506,13 @@ impl RelayListener {
 
     pub fn completed_sessions(&self) -> usize {
         self.completed_sessions.load(Ordering::Acquire)
+    }
+
+    pub fn measurements(&self) -> Vec<RelaySessionSummary> {
+        self.measurements
+            .lock()
+            .map(|values| values.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -1183,6 +1828,70 @@ impl RelayConnectionOrchestrator {
 pub struct RelayPieceEnvelope {
     pub header: EncryptedPieceHeader,
     pub ciphertext: String,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayDataFrame {
+    pub kind: String,
+    pub version: u32,
+    pub piece: Option<RelayPieceEnvelope>,
+    pub revocation: Option<BranchRevocation>,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl RelayDataFrame {
+    pub fn piece(envelope: RelayPieceEnvelope) -> Self {
+        Self {
+            kind: "zapdrop_relay_data".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            piece: Some(envelope),
+            revocation: None,
+        }
+    }
+
+    pub fn revocation(revocation: BranchRevocation) -> Self {
+        Self {
+            kind: "zapdrop_relay_data".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            piece: None,
+            revocation: Some(revocation),
+        }
+    }
+
+    pub fn validate_basic(&self) -> Result<(), SwarmValidationError> {
+        if self.kind != "zapdrop_relay_data"
+            || self.version != SWARM_PROTOCOL_VERSION
+            || self.piece.is_some() == self.revocation.is_some()
+        {
+            return Err(SwarmValidationError::InvalidValue(
+                "relay data frame".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn seal_relay_data(
+    channel: &mut SecureChannel,
+    data: &RelayDataFrame,
+) -> Result<EncryptedFrame, SecureError> {
+    data.validate_basic()
+        .map_err(|error| SecureError::Invalid(error.to_string()))?;
+    seal_wire_json(channel, data, RELAY_DATA_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn open_relay_data(
+    channel: &mut SecureChannel,
+    frame: &EncryptedFrame,
+) -> Result<RelayDataFrame, SecureError> {
+    let data: RelayDataFrame = open_wire_json(channel, frame, RELAY_DATA_AAD)?;
+    data.validate_basic()
+        .map_err(|error| SecureError::Invalid(error.to_string()))?;
+    Ok(data)
 }
 
 #[cfg(feature = "swarm-tree-mesh")]
@@ -1516,15 +2225,16 @@ mod tests {
                 reason: "authorized relay has no valid capability grant".to_string(),
             }
         );
+        let relay_plan = plan_topology(
+            &job(DistributionMode::Tree),
+            &candidates,
+            Some(&relay_grant),
+            100,
+            100,
+        )
+        .unwrap();
         assert_eq!(
-            plan_topology(
-                &job(DistributionMode::Tree),
-                &candidates,
-                Some(&relay_grant),
-                100,
-                100,
-            )
-            .unwrap(),
+            relay_plan.clone(),
             TopologyPlan::Relay {
                 job_id: "job-1".to_string(),
                 snapshot_root: "root-1".to_string(),
@@ -1533,6 +2243,12 @@ mod tests {
                 allowed_object_ids: vec!["object-1".to_string()],
                 max_bytes: 100,
                 expires_at: 9_000,
+            }
+        );
+        assert_eq!(
+            relay_plan.fallback_after_relay_failure("connection timeout"),
+            TopologyPlan::DirectFallback {
+                reason: "relay unavailable: connection timeout".to_string(),
             }
         );
     }
@@ -1638,8 +2354,10 @@ mod tests {
             std::env::temp_dir().join(format!("zapdrop-live-relay-{}", uuid::Uuid::new_v4()));
         let relay_store = SettingsStore::new(root.join("relay-data"));
         let sender_store = SettingsStore::new(root.join("sender-data"));
+        let child_store = SettingsStore::new(root.join("child-data"));
         let relay_identity = DeviceIdentity::load_or_create(&relay_store).unwrap();
         let sender_identity = DeviceIdentity::load_or_create(&sender_store).unwrap();
+        let child_identity = DeviceIdentity::load_or_create(&child_store).unwrap();
         let relay_trust = TrustedPeerStore::load(&relay_store).unwrap();
         relay_trust
             .upsert(TrustedPeer {
@@ -1648,6 +2366,18 @@ mod tests {
                 name: "Trusted Sender".to_string(),
                 public_key: sender_identity.public_key.clone(),
                 fingerprint: sender_identity.fingerprint.clone(),
+                first_seen: 1,
+                last_seen: 1,
+                endpoint: "127.0.0.1:0".to_string(),
+            })
+            .unwrap();
+        relay_trust
+            .upsert(TrustedPeer {
+                version: 1,
+                peer_id: child_identity.device_id.clone(),
+                name: "Trusted Child".to_string(),
+                public_key: child_identity.public_key.clone(),
+                fingerprint: child_identity.fingerprint.clone(),
                 first_seen: 1,
                 last_seen: 1,
                 endpoint: "127.0.0.1:0".to_string(),
@@ -1670,7 +2400,10 @@ mod tests {
 
             sender_fingerprint: sender_identity.fingerprint.clone(),
             snapshot_root: "live-relay-root".to_string(),
-            recipient_ids: vec![relay_identity.device_id.clone(), "child".to_string()],
+            recipient_ids: vec![
+                relay_identity.device_id.clone(),
+                child_identity.device_id.clone(),
+            ],
             distribution_mode: DistributionMode::Tree,
             chunk_profile: ChunkProfile::default(),
             content_key_id: "live-relay-key".to_string(),
@@ -1684,7 +2417,7 @@ mod tests {
             job_id: job.job_id.clone(),
             snapshot_root: job.snapshot_root.clone(),
             relay_id: relay_identity.device_id.clone(),
-            child_ids: vec!["child".to_string()],
+            child_ids: vec![child_identity.device_id.clone()],
             allowed_object_ids: vec!["object-1".to_string()],
             operations: vec![CapabilityOperation::ForwardPiece],
             max_bytes: 1024,
@@ -1699,7 +2432,7 @@ mod tests {
             snapshot_root: job.snapshot_root.clone(),
             relay_id: relay_identity.device_id.clone(),
             parent_id: sender_identity.device_id.clone(),
-            child_id: "child".to_string(),
+            child_id: child_identity.device_id.clone(),
             allowed_object_ids: vec!["object-1".to_string()],
             max_bytes: 1024,
             expires_at: now + 200,
@@ -1739,20 +2472,70 @@ mod tests {
             b"live relay",
         )
         .unwrap();
-        client
-            .send_piece(&RelayPieceEnvelope {
-                header,
-                ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
-            })
-            .unwrap();
+        let envelope = RelayPieceEnvelope {
+            header,
+            ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
+        };
+        client.send_piece(&envelope).unwrap();
+        let child_peer = PeerRecord {
+            id: relay_identity.device_id.clone(),
+            name: "Trusted Relay".to_string(),
+            platform: "windows".to_string(),
+            fingerprint: Some(relay_identity.fingerprint.clone()),
+            public_key: Some(relay_identity.public_key.clone()),
+            endpoint: endpoint.to_string(),
+            port: endpoint.port(),
+            status: "trusted".to_string(),
+            discovered_via: "loopback-test".to_string(),
+            last_seen: now,
+            trusted: true,
+        };
+        let mut child = connect_relay_child_session(
+            &child_identity,
+            &child_store,
+            &child_peer,
+            &open.job,
+            &open.assignment,
+        )
+        .unwrap();
+        let received = child
+            .request_piece("object-1", "piece-1", 0)
+            .unwrap()
+            .expect("relay should return the uploaded opaque piece");
+        assert_eq!(received, envelope);
+        let revocation = BranchRevocation {
+            kind: "zapdrop_branch_revocation".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: open.job.job_id.clone(),
+            branch_root_id: open.assignment.child_id.clone(),
+            revoked_peer_ids: vec![child_identity.device_id.clone()],
+            issued_at: now,
+            reason: "child session revoked for test".to_string(),
+        };
+        client.send_revocation(&revocation).unwrap();
+        assert!(child
+            .request_piece("object-1", "piece-1", 0)
+            .unwrap()
+            .is_none());
+        drop(child);
         drop(client);
         for _ in 0..100 {
-            if relay_listener.completed_sessions() == 1 {
+            if relay_listener.completed_sessions() == 2 {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(relay_listener.completed_sessions(), 1);
+        assert_eq!(relay_listener.completed_sessions(), 2);
+        let measurements = relay_listener.measurements();
+        assert_eq!(measurements.len(), 2);
+        assert!(measurements.iter().all(|summary| {
+            summary.job_id == "live-relay-job"
+                && summary.pieces_received == 1
+                && summary.bytes_received > 0
+        }));
+        assert!(measurements
+            .iter()
+            .all(|summary| summary.duration_ms < 12_000));
         drop(relay_listener);
         std::fs::remove_dir_all(root).unwrap();
     }
