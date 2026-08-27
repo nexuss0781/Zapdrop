@@ -1,0 +1,17 @@
+{
+  "name": "zapdrop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Offline local-network file sharing for nearby PCs",
+  "scripts": {
+    "install:app": "pnpm --dir apps/zapdrop-desktop install",
+    "dev": "pnpm --dir apps/zapdrop-desktop tauri dev",
+    "build": "pnpm --dir apps/zapdrop-desktop build",
+    "check": "cargo check --manifest-path apps/zapdrop-desktop/src-tauri/Cargo.toml",
+    "desktop:build": "pnpm --dir apps/zapdrop-desktop tauri build --no-bundle"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@10.4.1"
+}
