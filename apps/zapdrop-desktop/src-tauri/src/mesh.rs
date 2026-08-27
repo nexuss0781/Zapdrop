@@ -2,12 +2,24 @@ use crate::swarm::{
     CapabilityOperation, SwarmJob, SwarmValidationError, MAX_SWARM_OBJECTS, MAX_SWARM_RECIPIENTS,
     SWARM_PROTOCOL_VERSION,
 };
+#[cfg(feature = "swarm-tree-mesh")]
+use crate::swarm::{EncryptedPieceHeader, MAX_PIECE_SIZE};
+#[cfg(feature = "swarm-tree-mesh")]
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "swarm-tree-mesh")]
+use sha2::{Digest, Sha256};
+#[cfg(feature = "swarm-tree-mesh")]
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_BRANCH_CHILDREN: usize = 8;
 const MAX_RELAY_BYTES: u64 = 1 << 50;
+#[cfg(feature = "swarm-tree-mesh")]
+const MAX_RELAY_STORAGE_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(feature = "swarm-tree-mesh")]
+const MAX_RELAY_STORED_PIECES: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -226,6 +238,168 @@ pub fn plan_topology(
     })
 }
 
+#[cfg(feature = "swarm-tree-mesh")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayPieceEnvelope {
+    pub header: EncryptedPieceHeader,
+    pub ciphertext: String,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+fn validate_relay_piece(
+    job: &SwarmJob,
+    grant: &RelayGrant,
+    child_id: &str,
+    envelope: &RelayPieceEnvelope,
+    now: u64,
+) -> Result<usize, SwarmValidationError> {
+    grant.validate_for(job, now)?;
+    if !grant.permits_child(child_id) {
+        return Err(SwarmValidationError::Unauthorized("childId".to_string()));
+    }
+    let header = &envelope.header;
+    if header.job_id != job.job_id
+        || !grant.permits_object(&header.object_id, header.ciphertext_length)
+    {
+        return Err(SwarmValidationError::Unauthorized(
+            "piece scope".to_string(),
+        ));
+    }
+    header.validate_against(&job.chunk_profile)?;
+    let ciphertext = URL_SAFE_NO_PAD
+        .decode(&envelope.ciphertext)
+        .map_err(|_| SwarmValidationError::InvalidValue("ciphertext encoding".to_string()))?;
+    if ciphertext.is_empty()
+        || ciphertext.len() > MAX_PIECE_SIZE as usize + 64
+        || ciphertext.len() as u64 != header.ciphertext_length
+    {
+        return Err(SwarmValidationError::Limit("relay ciphertext".to_string()));
+    }
+    let digest = Sha256::digest(&ciphertext)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if digest != header.ciphertext_sha256 {
+        return Err(SwarmValidationError::InvalidValue(
+            "relay ciphertext digest".to_string(),
+        ));
+    }
+    Ok(ciphertext.len())
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+#[derive(Debug, Clone)]
+struct StoredRelayPiece {
+    envelope: RelayPieceEnvelope,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub struct RelayPieceStore {
+    job_id: String,
+    relay_id: String,
+    max_bytes: u64,
+    bytes_used: u64,
+    pieces: HashMap<(String, String, u64), StoredRelayPiece>,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl RelayPieceStore {
+    pub fn new(job: &SwarmJob, grant: &RelayGrant, now: u64) -> Result<Self, SwarmValidationError> {
+        grant.validate_for(job, now)?;
+        Ok(Self {
+            job_id: job.job_id.clone(),
+            relay_id: grant.relay_id.clone(),
+            max_bytes: grant.max_bytes.min(MAX_RELAY_STORAGE_BYTES),
+            bytes_used: 0,
+            pieces: HashMap::new(),
+        })
+    }
+
+    pub fn insert(
+        &mut self,
+        job: &SwarmJob,
+        grant: &RelayGrant,
+        child_id: &str,
+        envelope: RelayPieceEnvelope,
+        now: u64,
+    ) -> Result<bool, SwarmValidationError> {
+        if self.job_id != job.job_id || self.relay_id != grant.relay_id {
+            return Err(SwarmValidationError::Unauthorized(
+                "relay store job scope".to_string(),
+            ));
+        }
+        let ciphertext_bytes = validate_relay_piece(job, grant, child_id, &envelope, now)?;
+        let key = (
+            envelope.header.object_id.clone(),
+            envelope.header.piece_id.clone(),
+            envelope.header.index,
+        );
+        if let Some(existing) = self.pieces.get(&key) {
+            if existing.envelope == envelope {
+                return Ok(false);
+            }
+            return Err(SwarmValidationError::InvalidValue(
+                "conflicting relay piece".to_string(),
+            ));
+        }
+        if self.pieces.len() >= MAX_RELAY_STORED_PIECES {
+            return Err(SwarmValidationError::Limit(
+                "relay stored pieces".to_string(),
+            ));
+        }
+        let next_bytes = self
+            .bytes_used
+            .checked_add(ciphertext_bytes as u64)
+            .ok_or_else(|| SwarmValidationError::Limit("relay storage bytes".to_string()))?;
+        if next_bytes > self.max_bytes {
+            return Err(SwarmValidationError::Limit(
+                "relay storage bytes".to_string(),
+            ));
+        }
+        self.bytes_used = next_bytes;
+        self.pieces.insert(key, StoredRelayPiece { envelope });
+        Ok(true)
+    }
+
+    pub fn get_for_child(
+        &self,
+        job: &SwarmJob,
+        grant: &RelayGrant,
+        child_id: &str,
+        object_id: &str,
+        piece_id: &str,
+        index: u64,
+        now: u64,
+    ) -> Result<Option<RelayPieceEnvelope>, SwarmValidationError> {
+        if self.job_id != job.job_id || self.relay_id != grant.relay_id {
+            return Err(SwarmValidationError::Unauthorized(
+                "relay store job scope".to_string(),
+            ));
+        }
+        if !grant.permits_child(child_id) {
+            return Err(SwarmValidationError::Unauthorized("childId".to_string()));
+        }
+        grant.validate_for(job, now)?;
+        Ok(self
+            .pieces
+            .get(&(object_id.to_string(), piece_id.to_string(), index))
+            .map(|piece| piece.envelope.clone()))
+    }
+
+    pub fn bytes_used(&self) -> u64 {
+        self.bytes_used
+    }
+
+    pub fn len(&self) -> usize {
+        self.pieces.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchRevocation {
@@ -414,6 +588,71 @@ mod tests {
                 expires_at: 9_000,
             }
         );
+    }
+
+    #[cfg(feature = "swarm-tree-mesh")]
+    #[test]
+    fn feature_gated_relay_storage_forwards_opaque_encrypted_pieces() {
+        let job = job(DistributionMode::Tree);
+        let grant = grant();
+        let job_key = crate::secure::JobKey::generate();
+        let (header, ciphertext) = crate::secure::seal_piece(
+            &job_key,
+            &job.job_id,
+            &job.snapshot_root,
+            "piece-1",
+            "object-1",
+            0,
+            0,
+            b"opaque piece",
+        )
+        .unwrap();
+        let envelope = RelayPieceEnvelope {
+            header,
+            ciphertext: URL_SAFE_NO_PAD.encode(&ciphertext),
+        };
+        let mut store = RelayPieceStore::new(&job, &grant, 100).unwrap();
+        assert!(store
+            .insert(&job, &grant, "child", envelope.clone(), 100)
+            .unwrap());
+        assert!(!store
+            .insert(&job, &grant, "child", envelope.clone(), 100)
+            .unwrap());
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.bytes_used(), ciphertext.len() as u64);
+        let forwarded = store
+            .get_for_child(&job, &grant, "child", "object-1", "piece-1", 0, 100)
+            .unwrap();
+        assert_eq!(forwarded, Some(envelope.clone()));
+        assert_eq!(
+            crate::secure::open_piece(
+                &job_key,
+                &job.snapshot_root,
+                &envelope.header,
+                &URL_SAFE_NO_PAD.decode(&envelope.ciphertext).unwrap(),
+            )
+            .unwrap(),
+            b"opaque piece"
+        );
+
+        let mut wrong_child = envelope.clone();
+        assert!(store
+            .insert(&job, &grant, "attacker", wrong_child.clone(), 100)
+            .is_err());
+        wrong_child.header.object_id = "object-2".to_string();
+        assert!(store
+            .insert(&job, &grant, "child", wrong_child, 100)
+            .is_err());
+        let mut tampered = envelope.clone();
+        tampered.ciphertext = URL_SAFE_NO_PAD.encode(b"tampered");
+        assert!(store.insert(&job, &grant, "child", tampered, 100).is_err());
+
+        let mut limited_grant = grant.clone();
+        limited_grant.max_bytes = 1;
+        let mut limited_store = RelayPieceStore::new(&job, &limited_grant, 100).unwrap();
+        assert!(limited_store
+            .insert(&job, &limited_grant, "child", envelope, 100)
+            .is_err());
     }
 
     #[cfg(feature = "swarm-tree-mesh")]

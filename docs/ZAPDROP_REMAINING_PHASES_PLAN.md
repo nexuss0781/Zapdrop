@@ -148,11 +148,11 @@ The experimental v2 direct path now binds file-object IDs and serialized lengths
 
 ### Phase 17 — Phase 9 direct-only topology integration
 
-**State:** In progress; the first control-plane slice is complete, while encrypted forwarding integration remains open.
+**State:** In progress; topology planning and bounded opaque encrypted relay storage are complete, while live wire-level routing remains open.
 
-The first Phase 17 slice adds the explicit `swarm-tree-mesh` feature, dependent on experimental `swarm-v2`, and a topology planner that selects a relay only when the job mode, authorized and consented candidate, matching capability grant, object allow-list, byte budget, and expiry all validate. The resulting relay plan is bound to the exact job ID and snapshot root. Direct and queued jobs, missing capability, unavailable candidates, and insufficient grant budget produce an explicit direct fallback; invalid or mismatched grants fail closed. See `docs/ZAPDROP_PHASE17_TOPOLOGY_CONTROL_SLICE.md`.
+The Phase 17 control-plane slice adds the explicit `swarm-tree-mesh` feature, dependent on experimental `swarm-v2`, and a topology planner that selects a relay only when the job mode, authorized and consented candidate, matching capability grant, object allow-list, byte budget, and expiry all validate. The resulting relay plan is bound to the exact job ID and snapshot root. Direct and queued jobs, missing capability, unavailable candidates, and insufficient grant budget produce an explicit direct fallback; invalid or mismatched grants fail closed. `RelayPieceStore` now accepts only already-encrypted v2 piece envelopes within the validated job, child, object, digest, piece, and storage scopes, and never receives a job decryption key. See `docs/ZAPDROP_PHASE17_TOPOLOGY_CONTROL_SLICE.md`.
 
-The remaining Phase 17 work is a bounded authenticated control exchange and data-plane integration for branch assignment, encrypted piece forwarding, relay storage limits, revocation propagation, and direct fallback. Do not enable arbitrary forwarding.
+The remaining Phase 17 work is a bounded authenticated wire exchange and data-plane integration for branch assignment, end-to-end relay routing, multi-process forwarding, relay connection orchestration, parent failover, revocation propagation, and direct fallback. Do not enable arbitrary forwarding.
 
 **Exit evidence:** Multi-process tests demonstrate that unauthorized relays cannot receive or forward unrelated content, and direct fallback remains functional.
 
@@ -176,4 +176,4 @@ Run the full automated gate, build Windows artifacts, perform the physical-LAN m
 
 ## Immediate next move
 
-Phase 17 remains the only active phase. The next implementation action is **Phase 17’s bounded authenticated control-exchange slice**: integrate the validated topology plan without enabling arbitrary relay forwarding. No repair, companion, or release work will be started in the same phase. Each Phase 17 slice must be implemented, tested, documented, committed, and pushed before the next slice begins.
+Phase 17 remains the only active phase. The next implementation action is **Phase 17’s bounded authenticated wire-exchange slice**: integrate the validated topology plan and opaque relay envelope without enabling arbitrary relay forwarding. No repair, companion, or release work will be started in the same phase. Each Phase 17 slice must be implemented, tested, documented, committed, and pushed before the next slice begins.

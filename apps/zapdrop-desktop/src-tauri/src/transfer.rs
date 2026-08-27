@@ -4244,16 +4244,19 @@ mod tests {
                 )
             }
         });
-        for _ in 0..50 {
+        let offer_seen = (0..500).any(|_| {
             if approval_offers
                 .list(&received.to_string_lossy())
                 .iter()
                 .any(|offer| offer.transfer_id == "secure-v2-resume")
             {
-                break;
+                true
+            } else {
+                thread::sleep(Duration::from_millis(10));
+                false
             }
-            thread::sleep(Duration::from_millis(10));
-        }
+        });
+        assert!(offer_seen, "sparse-resume v2 offer was not observed");
         approval_offers
             .accept(
                 "secure-v2-resume",
