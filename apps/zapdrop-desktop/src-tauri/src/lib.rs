@@ -2,6 +2,7 @@ mod discovery;
 mod explorer;
 mod history;
 mod identity;
+pub mod mesh;
 mod network;
 mod pairing;
 pub mod secure;

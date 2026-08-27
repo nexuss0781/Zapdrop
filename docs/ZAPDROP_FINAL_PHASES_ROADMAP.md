@@ -147,7 +147,9 @@ The remaining Phase 8 work is a first-class UI parent-job view, global bandwidth
 
 **Objective:** Reduce source upload amplification for large groups while preserving least privilege.
 
-Implement capability-scoped forwarding, topology measurement, branch assignment, parent failover, alternate-peer repair, relay consent, global job revocation, and per-branch observability. Start with encrypted original pieces forwarded as ciphertext. Do not allow arbitrary relay requests or recipients outside the signed job set.
+**Implementation status:** The least-privilege control-plane foundation is implemented. Relay grants bind one job and snapshot to an authorized relay, explicit child set, `ForwardPiece` operation, object allow-list, byte budget, and bounded expiry. Topology selection ignores unauthorized, unconsented, capacity-constrained, or invalid candidates, and branch-revocation objects provide job-scoped revocation state. See `docs/ZAPDROP_PHASE9_STATUS.md`.
+
+Encrypted forwarding, relay storage, branch assignment on the wire, parent failover, alternate-peer repair, revocation propagation, and privacy analysis remain gated work. v2 remains direct-only until those controls are integrated and physically qualified. Do not allow arbitrary relay requests or recipients outside the signed job set.
 
 **Acceptance gate:** A tree job measurably reduces source upload for a defined multi-PC topology; a failed parent is repaired without corrupting the snapshot; a relay cannot access unrelated files; and direct fan-out remains available as a fallback.
 
