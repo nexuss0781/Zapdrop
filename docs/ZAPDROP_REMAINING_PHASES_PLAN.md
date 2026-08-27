@@ -148,7 +148,11 @@ The experimental v2 direct path now binds file-object IDs and serialized lengths
 
 ### Phase 17 — Phase 9 direct-only topology integration
 
-Only after the direct path and authorization gates are stable, implement the least-privilege tree/mesh data plane behind an explicit feature flag. Enforce signed job scope, relay consent, object allow-lists, byte budgets, expiry, revocation, and direct fallback. Do not enable arbitrary forwarding.
+**State:** In progress; the first control-plane slice is complete, while encrypted forwarding integration remains open.
+
+The first Phase 17 slice adds the explicit `swarm-tree-mesh` feature, dependent on experimental `swarm-v2`, and a topology planner that selects a relay only when the job mode, authorized and consented candidate, matching capability grant, object allow-list, byte budget, and expiry all validate. The resulting relay plan is bound to the exact job ID and snapshot root. Direct and queued jobs, missing capability, unavailable candidates, and insufficient grant budget produce an explicit direct fallback; invalid or mismatched grants fail closed. See `docs/ZAPDROP_PHASE17_TOPOLOGY_CONTROL_SLICE.md`.
+
+The remaining Phase 17 work is a bounded authenticated control exchange and data-plane integration for branch assignment, encrypted piece forwarding, relay storage limits, revocation propagation, and direct fallback. Do not enable arbitrary forwarding.
 
 **Exit evidence:** Multi-process tests demonstrate that unauthorized relays cannot receive or forward unrelated content, and direct fallback remains functional.
 
@@ -172,4 +176,4 @@ Run the full automated gate, build Windows artifacts, perform the physical-LAN m
 
 ## Immediate next move
 
-Phase 16 is complete in this revision. The next implementation action is **Phase 17 only**: direct-only tree/mesh topology integration behind an explicit feature flag. No repair, companion, or release work will be started in the same phase. Phase 17 must be implemented, tested, documented, committed, and pushed before the next phase begins.
+Phase 17 remains the only active phase. The next implementation action is **Phase 17’s bounded authenticated control-exchange slice**: integrate the validated topology plan without enabling arbitrary relay forwarding. No repair, companion, or release work will be started in the same phase. Each Phase 17 slice must be implemented, tested, documented, committed, and pushed before the next slice begins.

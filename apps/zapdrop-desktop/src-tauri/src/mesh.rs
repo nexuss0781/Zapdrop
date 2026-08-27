@@ -160,6 +160,72 @@ fn relay_score(candidate: &TopologyCandidate) -> f64 {
         * (1.0 - candidate.retry_rate)
 }
 
+#[cfg(feature = "swarm-tree-mesh")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TopologyPlan {
+    DirectFallback {
+        reason: String,
+    },
+    Relay {
+        job_id: String,
+        snapshot_root: String,
+        relay_id: String,
+        child_ids: Vec<String>,
+        allowed_object_ids: Vec<String>,
+        max_bytes: u64,
+        expires_at: u64,
+    },
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn plan_topology(
+    job: &SwarmJob,
+    candidates: &[TopologyCandidate],
+    grant: Option<&RelayGrant>,
+    required_bytes: u64,
+    now: u64,
+) -> Result<TopologyPlan, SwarmValidationError> {
+    if !matches!(
+        job.distribution_mode,
+        crate::swarm::DistributionMode::Tree | crate::swarm::DistributionMode::Mesh
+    ) {
+        return Ok(TopologyPlan::DirectFallback {
+            reason: "job distribution mode is direct-only".to_string(),
+        });
+    }
+    let Some(relay_id) = choose_relay(job, candidates, required_bytes) else {
+        return Ok(TopologyPlan::DirectFallback {
+            reason: "no authorized and consented relay satisfies capacity constraints".to_string(),
+        });
+    };
+    let Some(grant) = grant else {
+        return Ok(TopologyPlan::DirectFallback {
+            reason: "authorized relay has no valid capability grant".to_string(),
+        });
+    };
+    grant.validate_for(job, now)?;
+    if grant.relay_id != relay_id {
+        return Err(SwarmValidationError::Unauthorized(
+            "relay grant candidate mismatch".to_string(),
+        ));
+    }
+    if required_bytes > grant.max_bytes {
+        return Ok(TopologyPlan::DirectFallback {
+            reason: "relay grant byte budget is smaller than the planned transfer".to_string(),
+        });
+    }
+    Ok(TopologyPlan::Relay {
+        job_id: job.job_id.clone(),
+        snapshot_root: job.snapshot_root.clone(),
+        relay_id,
+        child_ids: grant.child_ids.clone(),
+        allowed_object_ids: grant.allowed_object_ids.clone(),
+        max_bytes: grant.max_bytes,
+        expires_at: grant.expires_at,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchRevocation {
@@ -294,5 +360,108 @@ mod tests {
             100,
         );
         assert_eq!(selected.as_deref(), Some("relay"));
+    }
+
+    #[cfg(feature = "swarm-tree-mesh")]
+    #[test]
+    fn feature_gated_topology_plan_preserves_direct_fallback() {
+        let candidates = [TopologyCandidate {
+            peer_id: "relay".to_string(),
+            throughput_bytes_per_second: 100.0,
+            round_trip_ms: 5.0,
+            retry_rate: 0.1,
+            available_bytes: 1_000,
+            relay_consent: true,
+            battery_constrained: false,
+        }];
+        let relay_grant = grant();
+
+        assert_eq!(
+            plan_topology(
+                &job(DistributionMode::Direct),
+                &candidates,
+                Some(&relay_grant),
+                100,
+                100,
+            )
+            .unwrap(),
+            TopologyPlan::DirectFallback {
+                reason: "job distribution mode is direct-only".to_string(),
+            }
+        );
+        assert_eq!(
+            plan_topology(&job(DistributionMode::Tree), &candidates, None, 100, 100,).unwrap(),
+            TopologyPlan::DirectFallback {
+                reason: "authorized relay has no valid capability grant".to_string(),
+            }
+        );
+        assert_eq!(
+            plan_topology(
+                &job(DistributionMode::Tree),
+                &candidates,
+                Some(&relay_grant),
+                100,
+                100,
+            )
+            .unwrap(),
+            TopologyPlan::Relay {
+                job_id: "job-1".to_string(),
+                snapshot_root: "root-1".to_string(),
+                relay_id: "relay".to_string(),
+                child_ids: vec!["child".to_string()],
+                allowed_object_ids: vec!["object-1".to_string()],
+                max_bytes: 100,
+                expires_at: 9_000,
+            }
+        );
+    }
+
+    #[cfg(feature = "swarm-tree-mesh")]
+    #[test]
+    fn feature_gated_topology_plan_rejects_invalid_or_mismatched_grants() {
+        let candidates = [TopologyCandidate {
+            peer_id: "relay".to_string(),
+            throughput_bytes_per_second: 100.0,
+            round_trip_ms: 5.0,
+            retry_rate: 0.1,
+            available_bytes: 1_000,
+            relay_consent: true,
+            battery_constrained: false,
+        }];
+        let mut invalid_grant = grant();
+        invalid_grant.allowed_object_ids.clear();
+        assert!(plan_topology(
+            &job(DistributionMode::Mesh),
+            &candidates,
+            Some(&invalid_grant),
+            100,
+            100,
+        )
+        .is_err());
+
+        let mut mismatched_grant = grant();
+        mismatched_grant.relay_id = "child".to_string();
+        assert!(plan_topology(
+            &job(DistributionMode::Tree),
+            &candidates,
+            Some(&mismatched_grant),
+            100,
+            100,
+        )
+        .is_err());
+
+        assert_eq!(
+            plan_topology(
+                &job(DistributionMode::Tree),
+                &candidates,
+                Some(&grant()),
+                101,
+                100,
+            )
+            .unwrap(),
+            TopologyPlan::DirectFallback {
+                reason: "relay grant byte budget is smaller than the planned transfer".to_string(),
+            }
+        );
     }
 }

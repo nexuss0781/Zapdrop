@@ -22,6 +22,7 @@ cargo fmt --manifest-path apps/zapdrop-desktop/src-tauri/Cargo.toml --check
 ./scripts/security_qualification.sh
 cargo test --manifest-path apps/zapdrop-desktop/src-tauri/Cargo.toml --lib local_three_recipient_parent_harness
 cargo test --manifest-path apps/zapdrop-desktop/src-tauri/Cargo.toml --features swarm-v2 --lib local_three_recipient_parent_harness
+cargo test --manifest-path apps/zapdrop-desktop/src-tauri/Cargo.toml --features swarm-tree-mesh --lib mesh::tests
 cargo test --manifest-path apps/zapdrop-desktop/src-tauri/Cargo.toml --lib
 cargo test --manifest-path apps/zapdrop-desktop/src-tauri/Cargo.toml --features swarm-v2 --lib
 cargo fmt --manifest-path apps/zapdrop-companion/Cargo.toml --check

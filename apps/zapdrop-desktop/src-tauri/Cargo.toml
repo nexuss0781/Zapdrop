@@ -41,3 +41,4 @@ zeroize = "1"
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 swarm-v2 = []
+swarm-tree-mesh = ["swarm-v2"]
