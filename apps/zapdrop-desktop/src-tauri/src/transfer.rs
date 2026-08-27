@@ -3176,7 +3176,10 @@ mod tests {
         io::Cursor,
         net::TcpListener,
         path::PathBuf,
-        sync::{Arc, Barrier, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier, Mutex,
+        },
         thread,
     };
     #[test]
@@ -3222,6 +3225,128 @@ mod tests {
             .is_none());
         assert!(destination_path(&root, "file.txt", "invalid").is_err());
         fs::remove_dir_all(PathBuf::from(root)).unwrap();
+    }
+
+    #[test]
+    fn local_three_recipient_parent_harness() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-fanout-harness-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let settings = SettingsStore::new(root.clone());
+        let history = HistoryStore::load(&settings).unwrap();
+        let manager = TransferManager::new(history.clone());
+        let parent_id = "local-fanout-harness";
+        let total_bytes = 300;
+        let peers = ["peer-1", "peer-2", "peer-3"];
+        history
+            .record(TransferHistoryEntry {
+                id: parent_id.to_string(),
+                transfer_id: parent_id.to_string(),
+                parent_id: None,
+                direction: "send".to_string(),
+                peer_id: "swarm".to_string(),
+                peer_name: "Swarm job".to_string(),
+                status: "started".to_string(),
+                source_names: vec!["fixture.bin".to_string()],
+                items: 1,
+                total_bytes,
+                bytes_done: 0,
+                conflict_policy: "rename".to_string(),
+                started_at: 1,
+                finished_at: None,
+                error: None,
+            })
+            .unwrap();
+        manager
+            .active
+            .lock()
+            .unwrap()
+            .insert(parent_id.to_string(), peers.len());
+        manager.cancel_recipient(parent_id, "peer-3");
+        let scheduler = SwarmScheduler::new(SwarmSchedulerOptions {
+            max_parallel_recipients: 1,
+            queue_limit: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let barrier = Arc::new(Barrier::new(peers.len()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for peer_id in peers {
+            let history = history.clone();
+            let manager = manager.clone();
+            let scheduler = scheduler.clone();
+            let barrier = Arc::clone(&barrier);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                let permit = scheduler.acquire(peer_id).unwrap();
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(2));
+                let cancelled = manager.is_cancelled_for(parent_id, peer_id);
+                let (status, bytes_done, error) = if cancelled {
+                    ("cancelled", 0, Some("recipient cancelled".to_string()))
+                } else if peer_id == "peer-2" {
+                    ("failed", 0, Some("simulated recipient failure".to_string()))
+                } else {
+                    ("completed", 100, None)
+                };
+                history
+                    .record(TransferHistoryEntry {
+                        id: format!("{parent_id}:{peer_id}"),
+                        transfer_id: parent_id.to_string(),
+                        parent_id: Some(parent_id.to_string()),
+                        direction: "send".to_string(),
+                        peer_id: peer_id.to_string(),
+                        peer_name: peer_id.to_string(),
+                        status: status.to_string(),
+                        source_names: vec!["fixture.bin".to_string()],
+                        items: 1,
+                        total_bytes: 100,
+                        bytes_done,
+                        conflict_policy: "rename".to_string(),
+                        started_at: 1,
+                        finished_at: Some(2),
+                        error,
+                    })
+                    .unwrap();
+                reconcile_parent_history(
+                    &history,
+                    parent_id,
+                    3,
+                    vec!["fixture.bin".to_string()],
+                    1,
+                    total_bytes,
+                    "rename",
+                );
+                active.fetch_sub(1, Ordering::SeqCst);
+                drop(permit);
+                manager.clear_recipient_cancel(parent_id, peer_id);
+                manager.finish(parent_id);
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let entries = history.list();
+        let parent = entries.iter().find(|entry| entry.id == parent_id).unwrap();
+        assert_eq!(parent.status, "partial");
+        assert_eq!(parent.bytes_done, 100);
+        assert_eq!(parent.total_bytes, total_bytes);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.parent_id.as_deref() == Some(parent_id))
+                .count(),
+            3
+        );
+        assert!(peak.load(Ordering::SeqCst) <= 1);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(!manager.active.lock().unwrap().contains_key(parent_id));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
