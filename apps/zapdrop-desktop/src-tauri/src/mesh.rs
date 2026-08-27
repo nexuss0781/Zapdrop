@@ -1,3 +1,5 @@
+#[cfg(feature = "swarm-tree-mesh")]
+use crate::secure::{EncryptedFrame, SecureChannel, SecureError};
 use crate::swarm::{
     CapabilityOperation, SwarmJob, SwarmValidationError, MAX_SWARM_OBJECTS, MAX_SWARM_RECIPIENTS,
     SWARM_PROTOCOL_VERSION,
@@ -20,6 +22,17 @@ const MAX_RELAY_BYTES: u64 = 1 << 50;
 const MAX_RELAY_STORAGE_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(feature = "swarm-tree-mesh")]
 const MAX_RELAY_STORED_PIECES: usize = 1024;
+#[cfg(feature = "swarm-tree-mesh")]
+const MAX_BRANCH_ASSIGNMENT_OBJECTS: usize = 4_096;
+#[cfg(feature = "swarm-tree-mesh")]
+const MAX_RELAY_CONNECTIONS: usize = 8;
+#[cfg(feature = "swarm-tree-mesh")]
+const BRANCH_ASSIGNMENT_AAD: &[u8] = b"zapdrop/swarm/v2/tree-mesh/branch-assignment";
+#[cfg(feature = "swarm-tree-mesh")]
+const RELAY_CONNECTION_REQUEST_AAD: &[u8] = b"zapdrop/swarm/v2/tree-mesh/relay-connection-request";
+#[cfg(feature = "swarm-tree-mesh")]
+const RELAY_CONNECTION_RESPONSE_AAD: &[u8] =
+    b"zapdrop/swarm/v2/tree-mesh/relay-connection-response";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -236,6 +249,372 @@ pub fn plan_topology(
         max_bytes: grant.max_bytes,
         expires_at: grant.expires_at,
     })
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+fn seal_wire_json<T: Serialize>(
+    channel: &mut SecureChannel,
+    value: &T,
+    aad: &[u8],
+) -> Result<EncryptedFrame, SecureError> {
+    let plaintext = serde_json::to_vec(value)
+        .map_err(|error| SecureError::Invalid(format!("wire serialization: {error}")))?;
+    channel.seal(&plaintext, aad)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+fn open_wire_json<T: for<'de> Deserialize<'de>>(
+    channel: &mut SecureChannel,
+    frame: &EncryptedFrame,
+    aad: &[u8],
+) -> Result<T, SecureError> {
+    let plaintext = channel.open(frame, aad)?;
+    serde_json::from_slice(&plaintext)
+        .map_err(|error| SecureError::Invalid(format!("wire deserialization: {error}")))
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn seal_branch_assignment(
+    channel: &mut SecureChannel,
+    assignment: &WireBranchAssignment,
+) -> Result<EncryptedFrame, SecureError> {
+    seal_wire_json(channel, assignment, BRANCH_ASSIGNMENT_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn open_branch_assignment(
+    channel: &mut SecureChannel,
+    frame: &EncryptedFrame,
+) -> Result<WireBranchAssignment, SecureError> {
+    open_wire_json(channel, frame, BRANCH_ASSIGNMENT_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn seal_relay_connection_request(
+    channel: &mut SecureChannel,
+    request: &RelayConnectionRequest,
+) -> Result<EncryptedFrame, SecureError> {
+    seal_wire_json(channel, request, RELAY_CONNECTION_REQUEST_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn open_relay_connection_request(
+    channel: &mut SecureChannel,
+    frame: &EncryptedFrame,
+) -> Result<RelayConnectionRequest, SecureError> {
+    open_wire_json(channel, frame, RELAY_CONNECTION_REQUEST_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn seal_relay_connection_response(
+    channel: &mut SecureChannel,
+    response: &RelayConnectionResponse,
+) -> Result<EncryptedFrame, SecureError> {
+    seal_wire_json(channel, response, RELAY_CONNECTION_RESPONSE_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub fn open_relay_connection_response(
+    channel: &mut SecureChannel,
+    frame: &EncryptedFrame,
+) -> Result<RelayConnectionResponse, SecureError> {
+    open_wire_json(channel, frame, RELAY_CONNECTION_RESPONSE_AAD)
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireBranchAssignment {
+    pub kind: String,
+    pub version: u32,
+    pub job_id: String,
+    pub snapshot_root: String,
+    pub relay_id: String,
+    pub parent_id: String,
+    pub child_id: String,
+    pub allowed_object_ids: Vec<String>,
+    pub max_bytes: u64,
+    pub expires_at: u64,
+    pub nonce: String,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl WireBranchAssignment {
+    pub fn validate_for(
+        &self,
+        job: &SwarmJob,
+        grant: &RelayGrant,
+        now: u64,
+    ) -> Result<(), SwarmValidationError> {
+        grant.validate_for(job, now)?;
+        if self.kind != "zapdrop_branch_assignment"
+            || self.version != SWARM_PROTOCOL_VERSION
+            || self.job_id != job.job_id
+            || self.snapshot_root != job.snapshot_root
+            || self.relay_id != grant.relay_id
+            || self.parent_id != job.sender_id
+            || !grant.permits_child(&self.child_id)
+            || self.child_id == self.relay_id
+        {
+            return Err(SwarmValidationError::Unauthorized(
+                "branch assignment scope".to_string(),
+            ));
+        }
+        if self.allowed_object_ids.is_empty()
+            || self.allowed_object_ids.len() > MAX_BRANCH_ASSIGNMENT_OBJECTS
+            || self.max_bytes == 0
+            || self.max_bytes > grant.max_bytes
+            || self.expires_at <= now
+            || self.expires_at > grant.expires_at
+            || self.nonce.is_empty()
+            || self.nonce.len() > 128
+        {
+            return Err(SwarmValidationError::Limit(
+                "branch assignment bounds".to_string(),
+            ));
+        }
+        let allowed = grant.allowed_object_ids.iter().collect::<HashSet<_>>();
+        let mut objects = HashSet::with_capacity(self.allowed_object_ids.len());
+        for object_id in &self.allowed_object_ids {
+            if !allowed.contains(object_id) || !objects.insert(object_id) {
+                return Err(SwarmValidationError::Unauthorized(
+                    "branch assignment objects".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayConnectionRequest {
+    pub kind: String,
+    pub version: u32,
+    pub job_id: String,
+    pub snapshot_root: String,
+    pub relay_id: String,
+    pub parent_id: String,
+    pub child_id: String,
+    pub assignment_nonce: String,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl RelayConnectionRequest {
+    pub fn from_assignment(assignment: &WireBranchAssignment) -> Self {
+        Self {
+            kind: "zapdrop_relay_connection_request".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: assignment.job_id.clone(),
+            snapshot_root: assignment.snapshot_root.clone(),
+            relay_id: assignment.relay_id.clone(),
+            parent_id: assignment.parent_id.clone(),
+            child_id: assignment.child_id.clone(),
+            assignment_nonce: assignment.nonce.clone(),
+        }
+    }
+
+    pub fn validate_for(
+        &self,
+        job: &SwarmJob,
+        assignment: &WireBranchAssignment,
+        now: u64,
+    ) -> Result<(), SwarmValidationError> {
+        assignment
+            .validate_for(
+                job,
+                &RelayGrant {
+                    kind: "zapdrop_relay_grant".to_string(),
+                    version: SWARM_PROTOCOL_VERSION,
+                    job_id: job.job_id.clone(),
+                    snapshot_root: job.snapshot_root.clone(),
+                    relay_id: assignment.relay_id.clone(),
+                    child_ids: vec![assignment.child_id.clone()],
+                    allowed_object_ids: assignment.allowed_object_ids.clone(),
+                    operations: vec![CapabilityOperation::ForwardPiece],
+                    max_bytes: assignment.max_bytes,
+                    expires_at: assignment.expires_at,
+                    nonce: assignment.nonce.clone(),
+                    signature: "wire-assignment-parent-validated".to_string(),
+                },
+                now,
+            )
+            .map_err(|_| {
+                SwarmValidationError::Unauthorized("relay connection request".to_string())
+            })?;
+        if self.kind != "zapdrop_relay_connection_request"
+            || self.version != SWARM_PROTOCOL_VERSION
+            || self.job_id != assignment.job_id
+            || self.snapshot_root != assignment.snapshot_root
+            || self.relay_id != assignment.relay_id
+            || self.parent_id != assignment.parent_id
+            || self.child_id != assignment.child_id
+            || self.assignment_nonce != assignment.nonce
+        {
+            return Err(SwarmValidationError::Unauthorized(
+                "relay connection request binding".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayConnectionResponse {
+    pub kind: String,
+    pub version: u32,
+    pub job_id: String,
+    pub snapshot_root: String,
+    pub relay_id: String,
+    pub child_id: String,
+    pub assignment_nonce: String,
+    pub accepted: bool,
+    pub reason: Option<String>,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl RelayConnectionResponse {
+    pub fn validate_for(
+        &self,
+        job: &SwarmJob,
+        assignment: &WireBranchAssignment,
+        now: u64,
+    ) -> Result<(), SwarmValidationError> {
+        assignment
+            .validate_for(
+                job,
+                &RelayGrant {
+                    kind: "zapdrop_relay_grant".to_string(),
+                    version: SWARM_PROTOCOL_VERSION,
+                    job_id: job.job_id.clone(),
+                    snapshot_root: job.snapshot_root.clone(),
+                    relay_id: assignment.relay_id.clone(),
+                    child_ids: vec![assignment.child_id.clone()],
+                    allowed_object_ids: assignment.allowed_object_ids.clone(),
+                    operations: vec![CapabilityOperation::ForwardPiece],
+                    max_bytes: assignment.max_bytes,
+                    expires_at: assignment.expires_at,
+                    nonce: assignment.nonce.clone(),
+                    signature: "wire-assignment-parent-validated".to_string(),
+                },
+                now,
+            )
+            .map_err(|_| {
+                SwarmValidationError::Unauthorized("relay connection response".to_string())
+            })?;
+        if self.kind != "zapdrop_relay_connection_response"
+            || self.version != SWARM_PROTOCOL_VERSION
+            || self.job_id != assignment.job_id
+            || self.snapshot_root != assignment.snapshot_root
+            || self.relay_id != assignment.relay_id
+            || self.child_id != assignment.child_id
+            || self.assignment_nonce != assignment.nonce
+        {
+            return Err(SwarmValidationError::Unauthorized(
+                "relay connection response binding".to_string(),
+            ));
+        }
+        if !self.accepted && self.reason.as_deref().unwrap_or_default().trim().is_empty() {
+            return Err(SwarmValidationError::Required(
+                "relay connection rejection reason".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayConnectionState {
+    Assigned,
+    Connected,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+pub struct RelayConnectionOrchestrator {
+    job_id: String,
+    snapshot_root: String,
+    assignments: HashMap<String, (WireBranchAssignment, RelayConnectionState)>,
+}
+
+#[cfg(feature = "swarm-tree-mesh")]
+impl RelayConnectionOrchestrator {
+    pub fn new(job: &SwarmJob) -> Self {
+        Self {
+            job_id: job.job_id.clone(),
+            snapshot_root: job.snapshot_root.clone(),
+            assignments: HashMap::new(),
+        }
+    }
+
+    pub fn assign(
+        &mut self,
+        job: &SwarmJob,
+        grant: &RelayGrant,
+        assignment: WireBranchAssignment,
+        now: u64,
+    ) -> Result<RelayConnectionRequest, SwarmValidationError> {
+        if self.job_id != job.job_id || self.snapshot_root != job.snapshot_root {
+            return Err(SwarmValidationError::Unauthorized(
+                "relay orchestrator job scope".to_string(),
+            ));
+        }
+        assignment.validate_for(job, grant, now)?;
+        if self.assignments.len() >= MAX_RELAY_CONNECTIONS
+            && !self.assignments.contains_key(&assignment.child_id)
+        {
+            return Err(SwarmValidationError::Limit(
+                "relay branch connections".to_string(),
+            ));
+        }
+        if self.assignments.contains_key(&assignment.child_id) {
+            return Err(SwarmValidationError::Duplicate(
+                "relay child assignment".to_string(),
+            ));
+        }
+        let request = RelayConnectionRequest::from_assignment(&assignment);
+        self.assignments.insert(
+            assignment.child_id.clone(),
+            (assignment, RelayConnectionState::Assigned),
+        );
+        Ok(request)
+    }
+
+    pub fn complete(
+        &mut self,
+        job: &SwarmJob,
+        response: &RelayConnectionResponse,
+        now: u64,
+    ) -> Result<(), SwarmValidationError> {
+        let Some((assignment, state)) = self.assignments.get_mut(&response.child_id) else {
+            return Err(SwarmValidationError::Unauthorized(
+                "unknown relay branch".to_string(),
+            ));
+        };
+        response.validate_for(job, assignment, now)?;
+        if !response.accepted {
+            return Err(SwarmValidationError::Unauthorized(
+                "relay connection rejected".to_string(),
+            ));
+        }
+        *state = RelayConnectionState::Connected;
+        Ok(())
+    }
+
+    pub fn state(&self, child_id: &str) -> Option<RelayConnectionState> {
+        self.assignments.get(child_id).map(|(_, state)| *state)
+    }
+
+    pub fn len(&self) -> usize {
+        self.assignments.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.assignments.is_empty()
+    }
 }
 
 #[cfg(feature = "swarm-tree-mesh")]
@@ -588,6 +967,188 @@ mod tests {
                 expires_at: 9_000,
             }
         );
+    }
+
+    #[cfg(feature = "swarm-tree-mesh")]
+    #[test]
+    fn feature_gated_wire_branch_assignment_orchestrates_relay_connection() {
+        let job = job(DistributionMode::Tree);
+        let grant = grant();
+        let assignment = WireBranchAssignment {
+            kind: "zapdrop_branch_assignment".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: job.job_id.clone(),
+            snapshot_root: job.snapshot_root.clone(),
+            relay_id: "relay".to_string(),
+            parent_id: "sender".to_string(),
+            child_id: "child".to_string(),
+            allowed_object_ids: vec!["object-1".to_string()],
+            max_bytes: 100,
+            expires_at: 8_000,
+            nonce: "assignment-1".to_string(),
+        };
+        assignment.validate_for(&job, &grant, 100).unwrap();
+        let request = RelayConnectionRequest::from_assignment(&assignment);
+        request.validate_for(&job, &assignment, 100).unwrap();
+        let wire = serde_json::to_vec(&request).unwrap();
+        let decoded: RelayConnectionRequest = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(decoded, request);
+
+        let mut orchestrator = RelayConnectionOrchestrator::new(&job);
+        orchestrator
+            .assign(&job, &grant, assignment.clone(), 100)
+            .unwrap();
+        assert_eq!(
+            orchestrator.state("child"),
+            Some(RelayConnectionState::Assigned)
+        );
+        let response = RelayConnectionResponse {
+            kind: "zapdrop_relay_connection_response".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: job.job_id.clone(),
+            snapshot_root: job.snapshot_root.clone(),
+            relay_id: "relay".to_string(),
+            child_id: "child".to_string(),
+            assignment_nonce: "assignment-1".to_string(),
+            accepted: true,
+            reason: None,
+        };
+        orchestrator.complete(&job, &response, 100).unwrap();
+        assert_eq!(
+            orchestrator.state("child"),
+            Some(RelayConnectionState::Connected)
+        );
+        assert_eq!(orchestrator.len(), 1);
+        assert!(orchestrator.assign(&job, &grant, assignment, 100).is_err());
+    }
+
+    #[cfg(feature = "swarm-tree-mesh")]
+    #[test]
+    fn feature_gated_wire_branch_assignment_rejects_scope_and_replay_tampering() {
+        let job = job(DistributionMode::Mesh);
+        let grant = grant();
+        let mut assignment = WireBranchAssignment {
+            kind: "zapdrop_branch_assignment".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: job.job_id.clone(),
+            snapshot_root: job.snapshot_root.clone(),
+            relay_id: "relay".to_string(),
+            parent_id: "sender".to_string(),
+            child_id: "child".to_string(),
+            allowed_object_ids: vec!["object-2".to_string()],
+            max_bytes: 100,
+            expires_at: 8_000,
+            nonce: "assignment-2".to_string(),
+        };
+        assert!(assignment.validate_for(&job, &grant, 100).is_err());
+        assignment.allowed_object_ids = vec!["object-1".to_string()];
+        let mut orchestrator = RelayConnectionOrchestrator::new(&job);
+        orchestrator
+            .assign(&job, &grant, assignment.clone(), 100)
+            .unwrap();
+        let mut response = RelayConnectionResponse {
+            kind: "zapdrop_relay_connection_response".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: job.job_id.clone(),
+            snapshot_root: job.snapshot_root.clone(),
+            relay_id: "relay".to_string(),
+            child_id: "child".to_string(),
+            assignment_nonce: "wrong-nonce".to_string(),
+            accepted: true,
+            reason: None,
+        };
+        assert!(orchestrator.complete(&job, &response, 100).is_err());
+        response.assignment_nonce = assignment.nonce.clone();
+        response.child_id = "attacker".to_string();
+        assert!(orchestrator.complete(&job, &response, 100).is_err());
+    }
+
+    #[cfg(feature = "swarm-tree-mesh")]
+    #[test]
+    fn feature_gated_wire_messages_use_authenticated_ordered_channels() {
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let fingerprint = Sha256::digest(signing.verifying_key().to_bytes())
+            .iter()
+            .take(12)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let (hello_parent, keys_parent) = crate::secure::SecureHandshake::create(
+            &signing,
+            "wire-session".to_string(),
+            "parent".to_string(),
+            fingerprint.clone(),
+        )
+        .unwrap();
+        let (hello_relay, keys_relay) = crate::secure::SecureHandshake::create(
+            &signing,
+            "wire-session".to_string(),
+            "relay".to_string(),
+            fingerprint.clone(),
+        )
+        .unwrap();
+        let mut parent = crate::secure::establish_channel(
+            &keys_parent,
+            &hello_parent,
+            &hello_relay,
+            &signing.verifying_key(),
+            "relay",
+            &fingerprint,
+            crate::secure::ChannelRole::Initiator,
+        )
+        .unwrap();
+        let mut relay = crate::secure::establish_channel(
+            &keys_relay,
+            &hello_relay,
+            &hello_parent,
+            &signing.verifying_key(),
+            "parent",
+            &fingerprint,
+            crate::secure::ChannelRole::Responder,
+        )
+        .unwrap();
+        let job = job(DistributionMode::Tree);
+        let grant = grant();
+        let assignment = WireBranchAssignment {
+            kind: "zapdrop_branch_assignment".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: job.job_id.clone(),
+            snapshot_root: job.snapshot_root.clone(),
+            relay_id: "relay".to_string(),
+            parent_id: "sender".to_string(),
+            child_id: "child".to_string(),
+            allowed_object_ids: vec!["object-1".to_string()],
+            max_bytes: 100,
+            expires_at: 8_000,
+            nonce: "wire-assignment".to_string(),
+        };
+        let assignment_frame = seal_branch_assignment(&mut parent, &assignment).unwrap();
+        let decoded_assignment = open_branch_assignment(&mut relay, &assignment_frame).unwrap();
+        decoded_assignment.validate_for(&job, &grant, 100).unwrap();
+
+        let request = RelayConnectionRequest::from_assignment(&assignment);
+        let request_frame = seal_relay_connection_request(&mut parent, &request).unwrap();
+        let decoded_request = open_relay_connection_request(&mut relay, &request_frame).unwrap();
+        decoded_request
+            .validate_for(&job, &assignment, 100)
+            .unwrap();
+        let response = RelayConnectionResponse {
+            kind: "zapdrop_relay_connection_response".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: job.job_id.clone(),
+            snapshot_root: job.snapshot_root.clone(),
+            relay_id: "relay".to_string(),
+            child_id: "child".to_string(),
+            assignment_nonce: assignment.nonce.clone(),
+            accepted: true,
+            reason: None,
+        };
+        let response_frame = seal_relay_connection_response(&mut relay, &response).unwrap();
+        let decoded_response =
+            open_relay_connection_response(&mut parent, &response_frame).unwrap();
+        decoded_response
+            .validate_for(&job, &assignment, 100)
+            .unwrap();
     }
 
     #[cfg(feature = "swarm-tree-mesh")]
