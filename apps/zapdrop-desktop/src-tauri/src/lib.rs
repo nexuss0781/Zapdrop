@@ -1,13 +1,17 @@
 mod discovery;
 mod identity;
 mod network;
+mod pairing;
 mod settings;
+mod trust;
 
 use discovery::{manual_peer, NetworkDiagnostics, PeerRecord};
 use network::RuntimeState;
+use pairing::{PairingOutcome, PairingRequestView};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
+use trust::TrustedPeer;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -28,6 +32,8 @@ pub struct AppInfo {
     pub fingerprint: String,
     pub key_storage: String,
     pub data_directory: String,
+    pub pairing_port: u16,
+    pub trusted_peer_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -166,11 +172,136 @@ fn add_manual_endpoint(
     Ok(peer)
 }
 
+#[tauri::command]
+fn list_pending_pairings(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<PairingRequestView>, String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    Ok(runtime.pending_pairings())
+}
+
+#[tauri::command]
+fn list_trusted_peers(state: tauri::State<'_, AppState>) -> Result<Vec<TrustedPeer>, String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    Ok(runtime.trusted_peers())
+}
+
+#[tauri::command]
+fn pair_with_peer(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    peer_id: String,
+) -> Result<PairingOutcome, String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    let outcome = runtime
+        .pair_outbound(&peer_id)
+        .map_err(|error| error.to_string())?;
+    if outcome.status == "accepted" {
+        let trusted = TrustedPeer::from_pairing(&outcome);
+        runtime
+            .trust
+            .upsert(trusted.clone())
+            .map_err(|error| format!("could not save trusted peer: {error}"))?;
+        let _ = app.emit("peer-trust-updated", trusted);
+    }
+    let _ = app.emit("pairing-complete", outcome.clone());
+    Ok(outcome)
+}
+
+#[tauri::command]
+fn accept_pairing(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    request_id: String,
+) -> Result<PairingOutcome, String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    let pairing = runtime
+        .pairing
+        .as_ref()
+        .ok_or_else(|| "pairing listener is unavailable".to_string())?;
+    let trusted = pairing
+        .accept(
+            &request_id,
+            &runtime.identity,
+            &runtime.store,
+            &runtime.settings.device_name,
+        )
+        .map_err(|error| error.to_string())?;
+    runtime
+        .trust
+        .upsert(trusted.clone())
+        .map_err(|error| format!("could not save trusted peer: {error}"))?;
+    let outcome = PairingOutcome::accepted(&trusted);
+    let _ = app.emit("peer-trust-updated", trusted);
+    let _ = app.emit("pairing-complete", outcome.clone());
+    Ok(outcome)
+}
+
+#[tauri::command]
+fn reject_pairing(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    request_id: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    let pairing = runtime
+        .pairing
+        .as_ref()
+        .ok_or_else(|| "pairing listener is unavailable".to_string())?;
+    pairing
+        .reject(
+            &request_id,
+            &runtime.identity,
+            &runtime.store,
+            &runtime.settings.device_name,
+            reason.unwrap_or_else(|| "rejected by user".to_string()),
+        )
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("pairing-rejected", request_id);
+    Ok(())
+}
+
+#[tauri::command]
+fn revoke_trusted_peer(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    peer_id: String,
+) -> Result<bool, String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    let removed = runtime
+        .trust
+        .remove(&peer_id)
+        .map_err(|error| format!("could not remove trusted peer: {error}"))?;
+    if removed {
+        let _ = app.emit("peer-trust-removed", peer_id);
+    }
+    Ok(removed)
+}
+
 fn app_info(runtime: &RuntimeState) -> AppInfo {
     AppInfo {
         name: "Zapdrop",
         version: APP_VERSION,
-        phase: "Settings and discovery",
+        phase: "Authenticated pairing",
         platform: std::env::consts::OS,
         local_only: true,
         device_id: runtime.identity.device_id.clone(),
@@ -178,6 +309,8 @@ fn app_info(runtime: &RuntimeState) -> AppInfo {
         fingerprint: runtime.identity.fingerprint.clone(),
         key_storage: runtime.identity.key_storage.clone(),
         data_directory: runtime.store.root().to_string_lossy().to_string(),
+        pairing_port: runtime.pairing_port(),
+        trusted_peer_count: runtime.trusted_peers().len(),
     }
 }
 
@@ -201,6 +334,12 @@ pub fn run() {
             get_network_diagnostics,
             scan_network,
             add_manual_endpoint,
+            list_pending_pairings,
+            list_trusted_peers,
+            pair_with_peer,
+            accept_pairing,
+            reject_pairing,
+            revoke_trusted_peer
         ])
         .run(tauri::generate_context!())
         .expect("error while running Zapdrop");

@@ -69,6 +69,23 @@ impl DeviceIdentity {
         Ok(identity)
     }
 
+    pub fn signing_key(&self, store: &SettingsStore) -> io::Result<SigningKey> {
+        let encoded = read_secret(store, self)?;
+        let decoded = BASE64.decode(encoded).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid private key encoding: {error}"),
+            )
+        })?;
+        let bytes: [u8; 32] = decoded.try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "private key must contain 32 bytes",
+            )
+        })?;
+        Ok(SigningKey::from_bytes(&bytes))
+    }
+
     pub fn reset(store: &SettingsStore) -> io::Result<Self> {
         if let Ok(identity) = self::load_identity_file(store) {
             let _ = delete_keyring_secret(&identity.device_id);

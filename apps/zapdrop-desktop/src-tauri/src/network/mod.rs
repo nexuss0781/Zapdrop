@@ -1,7 +1,9 @@
 use crate::{
     discovery::{DiscoveryService, NetworkDiagnostics, PeerRecord},
     identity::DeviceIdentity,
+    pairing::{PairingCoordinator, PairingOutcome, PairingRequestView},
     settings::{default_data_dir, AppSettings, SettingsStore},
+    trust::{TrustedPeer, TrustedPeerStore},
 };
 use std::{collections::HashMap, io};
 use tauri::AppHandle;
@@ -11,7 +13,10 @@ pub struct RuntimeState {
     pub settings: AppSettings,
     pub identity: DeviceIdentity,
     pub discovery: Option<DiscoveryService>,
+    pub pairing: Option<PairingCoordinator>,
+    pub trust: TrustedPeerStore,
     pub discovery_error: Option<String>,
+    pub pairing_error: Option<String>,
     pub manual_peers: HashMap<String, PeerRecord>,
 }
 
@@ -20,33 +25,30 @@ impl RuntimeState {
         let store = SettingsStore::new(default_data_dir());
         let settings = store.load()?;
         let identity = DeviceIdentity::load_or_create(&store)?;
-        let (discovery, discovery_error) = if settings.advertise_on_startup {
-            match DiscoveryService::start(
-                app.clone(),
-                &identity.device_id,
-                &settings.device_name,
-                &identity.fingerprint,
-            ) {
-                Ok(service) => (Some(service), None),
-                Err(error) => (None, Some(error.to_string())),
-            }
-        } else {
-            (None, Some("Discovery is disabled in Settings".to_string()))
-        };
-        Ok(Self {
+        let trust = TrustedPeerStore::load(&store)?;
+        let mut runtime = Self {
             store,
             settings,
             identity,
-            discovery,
-            discovery_error,
+            discovery: None,
+            pairing: None,
+            trust,
+            discovery_error: None,
+            pairing_error: None,
             manual_peers: HashMap::new(),
-        })
+        };
+        runtime.restart_discovery(&app);
+        Ok(runtime)
     }
 
     pub fn restart_discovery(&mut self, app: &AppHandle) {
+        self.stop_pairing();
         self.stop_discovery();
+        self.discovery_error = None;
+        self.pairing_error = None;
         if !self.settings.advertise_on_startup {
             self.discovery_error = Some("Discovery is disabled in Settings".to_string());
+            self.pairing_error = Some("Pairing listener is disabled in Settings".to_string());
             return;
         }
         match DiscoveryService::start(
@@ -54,15 +56,30 @@ impl RuntimeState {
             &self.identity.device_id,
             &self.settings.device_name,
             &self.identity.fingerprint,
+            &self.identity.public_key,
         ) {
             Ok(service) => {
+                let pairing = service
+                    .pairing_listener()
+                    .and_then(|listener| PairingCoordinator::start(listener, app.clone()));
+                match pairing {
+                    Ok(pairing) => self.pairing = Some(pairing),
+                    Err(error) => self.pairing_error = Some(error.to_string()),
+                }
                 self.discovery = Some(service);
-                self.discovery_error = None;
             }
             Err(error) => {
                 self.discovery = None;
                 self.discovery_error = Some(error.to_string());
+                self.pairing_error =
+                    Some("Pairing listener unavailable without a local endpoint".to_string());
             }
+        }
+    }
+
+    pub fn stop_pairing(&mut self) {
+        if let Some(mut pairing) = self.pairing.take() {
+            pairing.stop();
         }
     }
 
@@ -77,12 +94,30 @@ impl RuntimeState {
         if let Some(discovery) = &self.discovery {
             peers.extend(discovery.registry.list());
         }
+        for peer in &mut peers {
+            peer.trusted = self.trust.contains(&peer.id, peer.fingerprint.as_deref());
+            if peer.trusted && peer.status == "online" {
+                peer.status = "trusted".to_string();
+            }
+        }
         peers.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
         peers
     }
 
+    pub fn pending_pairings(&self) -> Vec<PairingRequestView> {
+        self.pairing
+            .as_ref()
+            .map(PairingCoordinator::pending)
+            .unwrap_or_default()
+    }
+
+    pub fn trusted_peers(&self) -> Vec<TrustedPeer> {
+        self.trust.list()
+    }
+
     pub fn diagnostics(&self) -> NetworkDiagnostics {
-        self.discovery
+        let mut diagnostics = self
+            .discovery
             .as_ref()
             .map(DiscoveryService::diagnostics)
             .unwrap_or_else(|| NetworkDiagnostics {
@@ -95,12 +130,48 @@ impl RuntimeState {
                     .discovery_error
                     .clone()
                     .unwrap_or_else(|| "Discovery is not running".to_string()),
+            });
+        if let Some(error) = &self.pairing_error {
+            diagnostics.interface_note = format!("{}; {}", diagnostics.interface_note, error);
+        }
+        diagnostics
+    }
+
+    pub fn pairing_port(&self) -> u16 {
+        self.pairing
+            .as_ref()
+            .map(|pairing| pairing.port)
+            .or_else(|| {
+                self.discovery
+                    .as_ref()
+                    .map(|discovery| discovery.diagnostics().listening_port)
             })
+            .unwrap_or(0)
+    }
+
+    pub fn pair_outbound(&self, peer_id: &str) -> io::Result<PairingOutcome> {
+        let peer = self
+            .peers()
+            .into_iter()
+            .find(|peer| peer.id == peer_id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "peer is no longer available")
+            })?;
+        let outcome = crate::pairing::request_pairing(
+            &peer.endpoint,
+            peer.fingerprint.as_deref(),
+            peer.public_key.as_deref(),
+            &self.identity,
+            &self.store,
+            &self.settings.device_name,
+        )?;
+        Ok(outcome)
     }
 }
 
 impl Drop for RuntimeState {
     fn drop(&mut self) {
+        self.stop_pairing();
         self.stop_discovery();
     }
 }

@@ -22,6 +22,7 @@ pub struct PeerRecord {
     pub name: String,
     pub platform: String,
     pub fingerprint: Option<String>,
+    pub public_key: Option<String>,
     pub endpoint: String,
     pub port: u16,
     pub status: String,
@@ -104,6 +105,7 @@ impl DiscoveryService {
         device_id: &str,
         device_name: &str,
         fingerprint: &str,
+        public_key: &str,
     ) -> io::Result<Self> {
         let local_ip = choose_local_ip()?;
         let listener = std::net::TcpListener::bind(SocketAddr::new(local_ip, 0))?;
@@ -121,6 +123,7 @@ impl DiscoveryService {
             ("name", device_name.to_string()),
             ("platform", std::env::consts::OS.to_string()),
             ("fingerprint", fingerprint.to_string()),
+            ("publicKey", public_key.to_string()),
             (
                 "caps",
                 "folders,multi-recipient,manual-endpoint".to_string(),
@@ -184,6 +187,15 @@ impl DiscoveryService {
             },
             registry,
         })
+    }
+
+    pub fn pairing_listener(&self) -> io::Result<std::net::TcpListener> {
+        self.listener
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "discovery listener is closed")
+            })?
+            .try_clone()
     }
 
     pub fn diagnostics(&self) -> NetworkDiagnostics {
@@ -250,6 +262,7 @@ pub fn manual_peer(endpoint: &str) -> io::Result<PeerRecord> {
         name: format!("Manual peer {}", endpoint),
         platform: "unknown".to_string(),
         fingerprint: None,
+        public_key: None,
         endpoint: endpoint.to_string(),
         port: socket.port(),
         status: "manual".to_string(),
@@ -288,6 +301,9 @@ fn peer_from_resolved(resolved: &mdns_sd::ResolvedService, own_id: &str) -> Opti
         name,
         platform,
         fingerprint,
+        public_key: resolved
+            .get_property_val_str("publicKey")
+            .map(ToString::to_string),
         endpoint: SocketAddr::new(address, resolved.port).to_string(),
         port: resolved.port,
         status: "online".to_string(),
