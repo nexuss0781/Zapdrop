@@ -316,6 +316,27 @@ impl SecureChannel {
         })
     }
 
+    pub fn wrap_job_key(
+        &self,
+        job: &SwarmJob,
+        recipient_id: &str,
+        key_id: &str,
+        job_key: &JobKey,
+    ) -> Result<JobKeyEnvelope, SecureError> {
+        let channel_key = JobKey::from_bytes(*self.send_key.as_bytes());
+        provision_job_key(job, recipient_id, key_id, job_key, &channel_key)
+    }
+
+    pub fn unwrap_job_key(
+        &self,
+        envelope: &JobKeyEnvelope,
+        job: &SwarmJob,
+        recipient_id: &str,
+    ) -> Result<JobKey, SecureError> {
+        let channel_key = JobKey::from_bytes(*self.receive_key.as_bytes());
+        open_job_key(envelope, job, recipient_id, &channel_key)
+    }
+
     pub fn open(&mut self, frame: &EncryptedFrame, aad: &[u8]) -> Result<Vec<u8>, SecureError> {
         if frame.sequence != self.next_receive_sequence || frame.sequence >= MAX_CHANNEL_FRAMES {
             return Err(SecureError::ReplayOrOutOfOrder);

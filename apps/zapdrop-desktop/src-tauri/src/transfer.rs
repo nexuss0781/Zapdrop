@@ -1,5 +1,11 @@
 #[cfg(feature = "swarm-v2")]
-use crate::secure::{establish_channel, ChannelRole, EncryptedFrame, SecureHandshake};
+use crate::secure::{
+    establish_channel, open_piece, seal_piece, ChannelRole, EncryptedFrame, JobKey, SecureHandshake,
+};
+#[cfg(feature = "swarm-v2")]
+use crate::swarm::{
+    ChunkProfile, DistributionMode, EncryptedPieceHeader, SwarmJob, SWARM_PROTOCOL_VERSION,
+};
 use crate::{
     discovery::PeerRecord,
     history::{HistoryStore, TransferHistoryEntry},
@@ -8,7 +14,11 @@ use crate::{
     settings::SettingsStore,
     trust::TrustedPeerStore,
 };
+#[cfg(feature = "swarm-v2")]
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+#[cfg(feature = "swarm-v2")]
+use ed25519_dalek::{Signature, Signer};
 use ed25519_dalek::{Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,6 +46,148 @@ const CHUNK_SIZE: usize = 1024 * 1024;
 const HELLO_ACCEPTED_KIND: &str = "zapdrop_transfer_hello_ok";
 const MAX_PARALLEL_RECIPIENTS: usize = 8;
 const OFFER_TIMEOUT_SECS: u64 = 120;
+#[cfg(feature = "swarm-v2")]
+const V2_JOB_AAD: &[u8] = b"zapdrop/swarm/v2/direct-job";
+#[cfg(feature = "swarm-v2")]
+const V2_PIECE_AAD: &[u8] = b"zapdrop/swarm/v2/direct-piece";
+#[cfg(feature = "swarm-v2")]
+const V2_COMPLETE_AAD: &[u8] = b"zapdrop/swarm/v2/direct-complete";
+#[cfg(feature = "swarm-v2")]
+const V2_DIRECT_OFFER_KIND: &str = "zapdrop_swarm_direct_offer";
+#[cfg(feature = "swarm-v2")]
+const V2_DIRECT_DECISION_KIND: &str = "zapdrop_swarm_direct_decision";
+#[cfg(feature = "swarm-v2")]
+const V2_DIRECT_PIECE_KIND: &str = "zapdrop_swarm_direct_piece";
+#[cfg(feature = "swarm-v2")]
+const V2_DIRECT_COMPLETE_KIND: &str = "zapdrop_swarm_direct_complete";
+
+#[cfg(feature = "swarm-v2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2DirectOffer {
+    kind: String,
+    version: u32,
+    job: SwarmJob,
+    items: Vec<ManifestItem>,
+    total_bytes: u64,
+    conflict_policy: String,
+    key_envelope: Option<crate::secure::JobKeyEnvelope>,
+}
+
+#[cfg(feature = "swarm-v2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2DirectKeyProvision {
+    kind: String,
+    version: u32,
+    job_id: String,
+    key_envelope: crate::secure::JobKeyEnvelope,
+}
+
+#[cfg(feature = "swarm-v2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2DirectDecision {
+    kind: String,
+    version: u32,
+    job_id: String,
+    accepted: bool,
+    destination: Option<String>,
+    conflict_policy: String,
+    reason: Option<String>,
+}
+
+#[cfg(feature = "swarm-v2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2DirectPiece {
+    kind: String,
+    version: u32,
+    header: EncryptedPieceHeader,
+    ciphertext: String,
+}
+
+#[cfg(feature = "swarm-v2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2DirectCompletion {
+    kind: String,
+    version: u32,
+    job_id: String,
+    status: String,
+    total_bytes: u64,
+    digest: String,
+    reason: Option<String>,
+}
+
+#[cfg(feature = "swarm-v2")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct V2JobUnsigned<'a> {
+    kind: &'a str,
+    version: u32,
+    job_id: &'a str,
+    sender_id: &'a str,
+    sender_public_key: &'a str,
+    sender_fingerprint: &'a str,
+    snapshot_root: &'a str,
+    recipient_ids: &'a [String],
+    distribution_mode: DistributionMode,
+    chunk_profile: &'a ChunkProfile,
+    content_key_id: &'a str,
+    created_at: u64,
+    expires_at: u64,
+}
+
+#[cfg(feature = "swarm-v2")]
+fn v2_job_signing_bytes(job: &SwarmJob) -> io::Result<Vec<u8>> {
+    serde_json::to_vec(&V2JobUnsigned {
+        kind: &job.kind,
+        version: job.version,
+        job_id: &job.job_id,
+        sender_id: &job.sender_id,
+        sender_public_key: &job.sender_public_key,
+        sender_fingerprint: &job.sender_fingerprint,
+        snapshot_root: &job.snapshot_root,
+        recipient_ids: &job.recipient_ids,
+        distribution_mode: job.distribution_mode,
+        chunk_profile: &job.chunk_profile,
+        content_key_id: &job.content_key_id,
+        created_at: job.created_at,
+        expires_at: job.expires_at,
+    })
+    .map_err(invalid)
+}
+
+#[cfg(feature = "swarm-v2")]
+fn sign_v2_job(job: &mut SwarmJob, signing_key: &ed25519_dalek::SigningKey) -> io::Result<()> {
+    let bytes = v2_job_signing_bytes(job)?;
+    job.signature = URL_SAFE_NO_PAD.encode(signing_key.sign(&bytes).to_bytes());
+    Ok(())
+}
+
+#[cfg(feature = "swarm-v2")]
+fn verify_v2_job(job: &SwarmJob, verifying_key: &VerifyingKey) -> io::Result<()> {
+    job.validate_at(v2_epoch_seconds()).map_err(invalid)?;
+    let signature_bytes = URL_SAFE_NO_PAD.decode(&job.signature).map_err(invalid)?;
+    let signature_bytes: [u8; 64] = signature_bytes
+        .try_into()
+        .map_err(|_| invalid("invalid v2 job signature length"))?;
+    verifying_key
+        .verify(
+            &v2_job_signing_bytes(job)?,
+            &Signature::from_bytes(&signature_bytes),
+        )
+        .map_err(|_| invalid("v2 job signature verification failed"))
+}
+
+#[cfg(feature = "swarm-v2")]
+fn v2_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -159,21 +311,38 @@ struct PendingTransferOffer {
     received_at: u64,
 }
 
+#[cfg(feature = "swarm-v2")]
+struct PendingV2TransferOffer {
+    stream: TcpStream,
+    reader: BufReader<TcpStream>,
+    channel: crate::secure::SecureChannel,
+    offer: V2DirectOffer,
+    peer_id: String,
+    peer_name: String,
+    peer_key: VerifyingKey,
+    received_at: u64,
+}
+
 #[derive(Clone)]
 pub struct ReceiveOfferCoordinator {
     pending: Arc<Mutex<HashMap<String, PendingTransferOffer>>>,
+    #[cfg(feature = "swarm-v2")]
+    pending_v2: Arc<Mutex<HashMap<String, PendingV2TransferOffer>>>,
 }
 
 impl ReceiveOfferCoordinator {
     pub fn new() -> Self {
         Self {
             pending: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "swarm-v2")]
+            pending_v2: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn list(&self, default_directory: &str) -> Vec<IncomingTransferOffer> {
         self.purge_expired();
-        self.pending
+        let mut offers = self
+            .pending
             .lock()
             .expect("pending transfer offers poisoned")
             .values()
@@ -188,7 +357,26 @@ impl ReceiveOfferCoordinator {
                 conflicts: existing_conflicts(default_directory, &offer.manifest),
                 received_at: offer.received_at,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        #[cfg(feature = "swarm-v2")]
+        offers.extend(
+            self.pending_v2
+                .lock()
+                .expect("pending v2 transfer offers poisoned")
+                .values()
+                .map(|offer| IncomingTransferOffer {
+                    transfer_id: offer.offer.job.job_id.clone(),
+                    peer_id: offer.peer_id.clone(),
+                    peer_name: offer.peer_name.clone(),
+                    items: offer.offer.items.clone(),
+                    total_bytes: offer.offer.total_bytes,
+                    conflict_policy: offer.offer.conflict_policy.clone(),
+                    default_receive_directory: default_directory.to_string(),
+                    conflicts: existing_v2_conflicts(default_directory, &offer.offer),
+                    received_at: offer.received_at,
+                }),
+        );
+        offers
     }
 
     fn purge_expired(&self) {
@@ -196,6 +384,11 @@ impl ReceiveOfferCoordinator {
         self.pending
             .lock()
             .expect("pending transfer offers poisoned")
+            .retain(|_, offer| offer.received_at >= cutoff);
+        #[cfg(feature = "swarm-v2")]
+        self.pending_v2
+            .lock()
+            .expect("pending v2 transfer offers poisoned")
             .retain(|_, offer| offer.received_at >= cutoff);
     }
 
@@ -207,6 +400,15 @@ impl ReceiveOfferCoordinator {
             .insert(offer.manifest.transfer_id.clone(), offer);
     }
 
+    #[cfg(feature = "swarm-v2")]
+    fn insert_v2(&self, offer: PendingV2TransferOffer) {
+        self.purge_expired();
+        self.pending_v2
+            .lock()
+            .expect("pending v2 transfer offers poisoned")
+            .insert(offer.offer.job.job_id.clone(), offer);
+    }
+
     pub fn accept(
         &self,
         transfer_id: &str,
@@ -214,6 +416,15 @@ impl ReceiveOfferCoordinator {
         destination: Option<String>,
         context: TransferServerContext,
     ) -> io::Result<()> {
+        #[cfg(feature = "swarm-v2")]
+        if self
+            .pending_v2
+            .lock()
+            .expect("pending v2 transfer offers poisoned")
+            .contains_key(transfer_id)
+        {
+            return self.accept_v2(transfer_id, policy, destination, context);
+        }
         let policy = normalize_conflict_policy(&policy)?;
         let destination = destination.unwrap_or_else(|| context.receive_directory.clone());
         let root = safe_root(&destination)?;
@@ -304,7 +515,94 @@ impl ReceiveOfferCoordinator {
         Ok(())
     }
 
+    #[cfg(feature = "swarm-v2")]
+    fn accept_v2(
+        &self,
+        transfer_id: &str,
+        policy: String,
+        destination: Option<String>,
+        context: TransferServerContext,
+    ) -> io::Result<()> {
+        let policy = normalize_conflict_policy(&policy)?;
+        let destination = destination.unwrap_or_else(|| context.receive_directory.clone());
+        let destination_root = safe_root(&destination)?;
+        let pending = self
+            .pending_v2
+            .lock()
+            .expect("pending v2 transfer offers poisoned")
+            .remove(transfer_id)
+            .ok_or_else(|| invalid("incoming transfer offer expired"))?;
+        let decision = V2DirectDecision {
+            kind: V2_DIRECT_DECISION_KIND.to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: pending.offer.job.job_id.clone(),
+            accepted: true,
+            destination: Some(destination_root.to_string_lossy().to_string()),
+            conflict_policy: policy.clone(),
+            reason: None,
+        };
+        let mut channel = pending.channel;
+        write_json_line(
+            &pending.stream,
+            &seal_v2_json(&mut channel, &decision, V2_JOB_AAD)?,
+        )?;
+        let mut receive_context = context;
+        receive_context.receive_directory = destination_root.to_string_lossy().to_string();
+        receive_context.default_conflict_policy = policy;
+        let stream = pending.stream;
+        let mut reader = pending.reader;
+        let offer = pending.offer;
+        let peer_id = pending.peer_id;
+        let peer_name = pending.peer_name;
+        let peer_key = pending.peer_key;
+        thread::Builder::new()
+            .name(format!("zapdrop-v2-receive-{transfer_id}"))
+            .spawn(move || {
+                let _ = receive_v2_direct(
+                    &stream,
+                    &mut reader,
+                    &mut channel,
+                    offer,
+                    &receive_context,
+                    &peer_id,
+                    &peer_name,
+                    &peer_key,
+                    true,
+                );
+            })
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        Ok(())
+    }
+
     pub fn reject(&self, transfer_id: &str, reason: String) -> io::Result<()> {
+        #[cfg(feature = "swarm-v2")]
+        if !self
+            .pending
+            .lock()
+            .expect("pending transfer offers poisoned")
+            .contains_key(transfer_id)
+        {
+            let pending = self
+                .pending_v2
+                .lock()
+                .expect("pending v2 transfer offers poisoned")
+                .remove(transfer_id)
+                .ok_or_else(|| invalid("incoming transfer offer expired"))?;
+            let mut channel = pending.channel;
+            let decision = V2DirectDecision {
+                kind: V2_DIRECT_DECISION_KIND.to_string(),
+                version: SWARM_PROTOCOL_VERSION,
+                job_id: transfer_id.to_string(),
+                accepted: false,
+                destination: None,
+                conflict_policy: "rename".to_string(),
+                reason: Some(reason),
+            };
+            return write_json_line(
+                &pending.stream,
+                &seal_v2_json(&mut channel, &decision, V2_JOB_AAD)?,
+            );
+        }
         let pending = self
             .pending
             .lock()
@@ -641,7 +939,58 @@ pub fn handle_secure_incoming(
             return;
         }
     };
-    let _ = write_json_line(&stream, &proof);
+    if write_json_line(&stream, &proof).is_err() {
+        return;
+    }
+    let mut reader = match stream.try_clone() {
+        Ok(clone) => BufReader::new(clone),
+        Err(_) => return,
+    };
+    let frame: EncryptedFrame = match read_json_line_from_reader(&mut reader) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let offer: V2DirectOffer = match open_v2_json(&mut channel, &frame, V2_JOB_AAD) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = write_error(&stream, &error.to_string());
+            return;
+        }
+    };
+    let received_at = epoch_seconds();
+    let transfer_id = offer.job.job_id.clone();
+    let incoming = IncomingTransferOffer {
+        transfer_id: transfer_id.clone(),
+        peer_id: trusted.peer_id.clone(),
+        peer_name: trusted.name.clone(),
+        items: offer.items.clone(),
+        total_bytes: offer.total_bytes,
+        conflict_policy: offer.conflict_policy.clone(),
+        default_receive_directory: context.receive_directory.clone(),
+        conflicts: existing_v2_conflicts(&context.receive_directory, &offer),
+        received_at,
+    };
+    context.offers.insert_v2(PendingV2TransferOffer {
+        stream,
+        reader,
+        channel,
+        offer,
+        peer_id: trusted.peer_id.clone(),
+        peer_name: trusted.name.clone(),
+        peer_key,
+        received_at,
+    });
+    if let Some(app) = context.app.as_ref() {
+        let _ = app.emit("incoming-transfer-offer", incoming);
+    }
+    if !context.always_ask_before_receive {
+        let _ = context.offers.accept(
+            &transfer_id,
+            context.default_conflict_policy.clone(),
+            None,
+            context.clone(),
+        );
+    }
 }
 
 pub fn handle_incoming(
@@ -739,6 +1088,345 @@ pub fn handle_incoming(
 }
 
 #[cfg(feature = "swarm-v2")]
+fn seal_v2_json<T: Serialize>(
+    channel: &mut crate::secure::SecureChannel,
+    value: &T,
+    aad: &[u8],
+) -> io::Result<EncryptedFrame> {
+    let bytes = serde_json::to_vec(value).map_err(invalid)?;
+    channel.seal(&bytes, aad).map_err(invalid)
+}
+
+#[cfg(feature = "swarm-v2")]
+fn open_v2_json<T: for<'de> Deserialize<'de>>(
+    channel: &mut crate::secure::SecureChannel,
+    frame: &EncryptedFrame,
+    aad: &[u8],
+) -> io::Result<T> {
+    let bytes = channel.open(frame, aad).map_err(invalid)?;
+    serde_json::from_slice(&bytes).map_err(invalid)
+}
+
+#[cfg(feature = "swarm-v2")]
+fn v2_public_key(identity: &DeviceIdentity) -> io::Result<String> {
+    let bytes = BASE64.decode(&identity.public_key).map_err(invalid)?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+#[cfg(feature = "swarm-v2")]
+fn create_v2_job(
+    identity: &DeviceIdentity,
+    transfer_id: &str,
+    recipient_id: &str,
+    items: &[ManifestItem],
+    signing_key: &ed25519_dalek::SigningKey,
+) -> io::Result<(SwarmJob, JobKey)> {
+    let created_at = v2_epoch_seconds();
+    let profile = ChunkProfile {
+        profile_id: "fixed-4m-sha256-aead".to_string(),
+        piece_size: crate::swarm::DEFAULT_PIECE_SIZE,
+        max_in_flight_pieces: 8,
+        hash: "sha256".to_string(),
+        aead: "x25519-hkdf-sha256-chacha20poly1305".to_string(),
+    };
+    let snapshot_bytes = serde_json::to_vec(items).map_err(invalid)?;
+    let snapshot_root = format!("sha256:{}", digest_bytes(&snapshot_bytes));
+    let mut job = SwarmJob {
+        kind: "zapdrop_swarm_job".to_string(),
+        version: SWARM_PROTOCOL_VERSION,
+        job_id: transfer_id.to_string(),
+        sender_id: identity.device_id.clone(),
+        sender_public_key: v2_public_key(identity)?,
+        sender_fingerprint: identity.fingerprint.clone(),
+        snapshot_root,
+        recipient_ids: vec![recipient_id.to_string()],
+        distribution_mode: DistributionMode::Direct,
+        chunk_profile: profile,
+        content_key_id: format!("key-{transfer_id}"),
+        created_at,
+        expires_at: created_at.saturating_add(2 * 60 * 60),
+        signature: String::new(),
+    };
+    sign_v2_job(&mut job, signing_key)?;
+    job.validate_at(created_at).map_err(invalid)?;
+    Ok((job, JobKey::generate()))
+}
+
+#[cfg(feature = "swarm-v2")]
+fn send_v2_direct(
+    identity: &DeviceIdentity,
+    store: &SettingsStore,
+    device_name: &str,
+    peer: &PeerRecord,
+    sources: &[TransferSource],
+    policy: &str,
+    transfer_id: &str,
+) -> io::Result<()> {
+    let address: SocketAddr = peer.endpoint.parse().map_err(invalid)?;
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(8))?;
+    stream.set_read_timeout(Some(Duration::from_secs(OFFER_TIMEOUT_SECS + 30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let signing_key = identity.signing_key(store)?;
+    let (hello, ephemeral) = SecureHandshake::create(
+        &signing_key,
+        transfer_id.to_string(),
+        identity.device_id.clone(),
+        identity.fingerprint.clone(),
+    )
+    .map_err(invalid)?;
+    write_json_line(&stream, &hello)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let peer_hello: SecureHandshake = read_json_line_from_reader(&mut reader)?;
+    let encoded_public_key = peer
+        .public_key
+        .as_deref()
+        .ok_or_else(|| invalid("peer public key is unavailable"))?;
+    let public_key_bytes = BASE64.decode(encoded_public_key).map_err(invalid)?;
+    let public_key_bytes: [u8; 32] = public_key_bytes
+        .try_into()
+        .map_err(|_| invalid("peer public key has invalid length"))?;
+    let peer_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(invalid)?;
+    let mut channel = establish_channel(
+        &ephemeral,
+        &hello,
+        &peer_hello,
+        &peer_key,
+        &peer.id,
+        peer.fingerprint.as_deref().unwrap_or_default(),
+        ChannelRole::Initiator,
+    )
+    .map_err(invalid)?;
+    let proof: EncryptedFrame = read_json_line_from_reader(&mut reader)?;
+    let proof_bytes = channel
+        .open(&proof, b"secure-handshake-confirmation")
+        .map_err(invalid)?;
+    if proof_bytes != b"zapdrop-v2-secure-ready" {
+        return Err(invalid("secure handshake proof mismatch"));
+    }
+    let manifest = build_manifest(sources)?;
+    let total_bytes = manifest.iter().map(|item| item.size).sum::<u64>();
+    let (job, job_key) = create_v2_job(identity, transfer_id, &peer.id, &manifest, &signing_key)?;
+    let offer = V2DirectOffer {
+        kind: V2_DIRECT_OFFER_KIND.to_string(),
+        version: SWARM_PROTOCOL_VERSION,
+        job: job.clone(),
+        items: manifest.clone(),
+        total_bytes,
+        conflict_policy: policy.to_string(),
+        key_envelope: None,
+    };
+    write_json_line(&stream, &seal_v2_json(&mut channel, &offer, V2_JOB_AAD)?)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let decision_frame: EncryptedFrame = read_json_line_from_reader(&mut reader)?;
+    let decision: V2DirectDecision = open_v2_json(&mut channel, &decision_frame, V2_JOB_AAD)?;
+    if !decision.accepted || decision.job_id != job.job_id {
+        return Err(invalid(
+            decision
+                .reason
+                .unwrap_or_else(|| "receiver rejected v2 direct job".to_string()),
+        ));
+    }
+    let key_envelope = channel
+        .wrap_job_key(&job, &peer.id, &job.content_key_id, &job_key)
+        .map_err(invalid)?;
+    let key_provision = V2DirectKeyProvision {
+        kind: "zapdrop_swarm_direct_key".to_string(),
+        version: SWARM_PROTOCOL_VERSION,
+        job_id: job.job_id.clone(),
+        key_envelope,
+    };
+    write_json_line(
+        &stream,
+        &seal_v2_json(&mut channel, &key_provision, V2_JOB_AAD)?,
+    )?;
+    let piece_size = job.chunk_profile.piece_size as usize;
+    for item in &manifest {
+        let source = source_for_item(sources, item)?;
+        let mut file = File::open(source)?;
+        let mut offset = 0u64;
+        let mut index = 0u64;
+        let mut buffer = vec![0u8; piece_size];
+        while offset < item.size {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                return Err(invalid("source ended before v2 manifest size"));
+            }
+            let piece_id = format!("piece-{}-{index}", item.item_id);
+            let (header, ciphertext) = seal_piece(
+                &job_key,
+                &job.job_id,
+                &job.snapshot_root,
+                &piece_id,
+                &item.item_id,
+                index,
+                offset,
+                &buffer[..read],
+            )
+            .map_err(invalid)?;
+            let piece = V2DirectPiece {
+                kind: V2_DIRECT_PIECE_KIND.to_string(),
+                version: SWARM_PROTOCOL_VERSION,
+                header,
+                ciphertext: BASE64.encode(ciphertext),
+            };
+            write_json_line(&stream, &seal_v2_json(&mut channel, &piece, V2_PIECE_AAD)?)?;
+            offset += read as u64;
+            index += 1;
+        }
+    }
+    let completion_frame: EncryptedFrame = read_json_line_from_reader(&mut reader)?;
+    let completion: V2DirectCompletion =
+        open_v2_json(&mut channel, &completion_frame, V2_COMPLETE_AAD)?;
+    if completion.kind != V2_DIRECT_COMPLETE_KIND
+        || completion.version != SWARM_PROTOCOL_VERSION
+        || completion.job_id != job.job_id
+        || completion.status != "completed"
+        || completion.total_bytes != total_bytes
+        || completion.digest != job.snapshot_root
+    {
+        return Err(invalid(completion.reason.unwrap_or_else(|| {
+            "v2 direct transfer completion proof failed".to_string()
+        })));
+    }
+    let _ = device_name;
+    Ok(())
+}
+
+#[cfg(feature = "swarm-v2")]
+fn receive_v2_direct(
+    stream: &TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    channel: &mut crate::secure::SecureChannel,
+    offer: V2DirectOffer,
+    context: &TransferServerContext,
+    peer_id: &str,
+    peer_name: &str,
+    peer_key: &VerifyingKey,
+    decision_already_sent: bool,
+) -> io::Result<()> {
+    if offer.kind != V2_DIRECT_OFFER_KIND || offer.version != SWARM_PROTOCOL_VERSION {
+        return Err(invalid("invalid v2 direct offer"));
+    }
+    verify_v2_job(&offer.job, peer_key)?;
+    if offer.job.sender_id != peer_id
+        || offer.job.sender_public_key != URL_SAFE_NO_PAD.encode(peer_key.to_bytes())
+        || offer.job.sender_fingerprint != fingerprint(&peer_key.to_bytes())
+        || !offer.job.authorizes(&context.identity.device_id)
+        || offer.items.is_empty()
+        || offer.items.len() > 100_000
+        || offer.key_envelope.is_some()
+        || offer.items.iter().map(|item| item.size).sum::<u64>() != offer.total_bytes
+    {
+        return Err(invalid("v2 direct job authorization or manifest mismatch"));
+    }
+    let policy = normalize_conflict_policy(&context.default_conflict_policy)?;
+    let destination = safe_root(&context.receive_directory)?;
+    if !decision_already_sent {
+        let decision = V2DirectDecision {
+            kind: V2_DIRECT_DECISION_KIND.to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: offer.job.job_id.clone(),
+            accepted: true,
+            destination: Some(destination.to_string_lossy().to_string()),
+            conflict_policy: policy.clone(),
+            reason: None,
+        };
+        write_json_line(stream, &seal_v2_json(channel, &decision, V2_JOB_AAD)?)?;
+    }
+    let key_frame: EncryptedFrame = read_json_line_from_reader(reader)?;
+    let key_provision: V2DirectKeyProvision = open_v2_json(channel, &key_frame, V2_JOB_AAD)?;
+    if key_provision.kind != "zapdrop_swarm_direct_key"
+        || key_provision.version != SWARM_PROTOCOL_VERSION
+        || key_provision.job_id != offer.job.job_id
+    {
+        return Err(invalid("invalid v2 job-key provision"));
+    }
+    let job_key = channel
+        .unwrap_job_key(
+            &key_provision.key_envelope,
+            &offer.job,
+            &context.identity.device_id,
+        )
+        .map_err(invalid)?;
+    let mut total_done = 0u64;
+    for item in &offer.items {
+        let partial = partial_path(&destination, &offer.job.job_id, item);
+        let mut offset = fs::metadata(&partial)
+            .map(|metadata| metadata.len().min(item.size))
+            .unwrap_or(0);
+        let mut index = offset / offer.job.chunk_profile.piece_size;
+        while offset < item.size {
+            let frame: EncryptedFrame = read_json_line_from_reader(reader)?;
+            let piece: V2DirectPiece = open_v2_json(channel, &frame, V2_PIECE_AAD)?;
+            if piece.kind != V2_DIRECT_PIECE_KIND || piece.version != SWARM_PROTOCOL_VERSION {
+                return Err(invalid("invalid v2 direct piece frame"));
+            }
+            piece
+                .header
+                .validate_against(&offer.job.chunk_profile)
+                .map_err(invalid)?;
+            if piece.header.job_id != offer.job.job_id
+                || piece.header.object_id != item.item_id
+                || piece.header.index != index
+                || piece.header.offset != offset
+                || piece.header.plaintext_length > item.size.saturating_sub(offset)
+            {
+                return Err(invalid("v2 direct piece does not match manifest offset"));
+            }
+            let ciphertext = BASE64.decode(&piece.ciphertext).map_err(invalid)?;
+            let plaintext = open_piece(
+                &job_key,
+                &offer.job.snapshot_root,
+                &piece.header,
+                &ciphertext,
+            )
+            .map_err(invalid)?;
+            if plaintext.len() as u64 != piece.header.plaintext_length {
+                return Err(invalid("v2 direct piece plaintext length mismatch"));
+            }
+            if let Some(parent) = partial.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&partial)?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(&plaintext)?;
+            file.flush()?;
+            offset += plaintext.len() as u64;
+            index += 1;
+            total_done += plaintext.len() as u64;
+        }
+        if digest_file(&partial)? != item.sha256 {
+            return Err(invalid("v2 direct file digest mismatch"));
+        }
+        if let Some(final_path) = destination_path(&destination, &item.relative_path, &policy)? {
+            if let Some(parent) = final_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(partial, final_path)?;
+        }
+    }
+    let completion = V2DirectCompletion {
+        kind: V2_DIRECT_COMPLETE_KIND.to_string(),
+        version: SWARM_PROTOCOL_VERSION,
+        job_id: offer.job.job_id,
+        status: "completed".to_string(),
+        total_bytes: total_done,
+        digest: offer.job.snapshot_root,
+        reason: None,
+    };
+    write_json_line(
+        stream,
+        &seal_v2_json(channel, &completion, V2_COMPLETE_AAD)?,
+    )?;
+    let _ = (context, peer_name);
+    Ok(())
+}
+
+#[cfg(feature = "swarm-v2")]
 fn send_v2_secure_probe(
     identity: &DeviceIdentity,
     store: &SettingsStore,
@@ -759,7 +1447,8 @@ fn send_v2_secure_probe(
     )
     .map_err(invalid)?;
     write_json_line(&stream, &hello)?;
-    let peer_hello: SecureHandshake = read_json_line(&stream)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let peer_hello: SecureHandshake = read_json_line_from_reader(&mut reader)?;
     let encoded_public_key = peer
         .public_key
         .as_deref()
@@ -779,7 +1468,7 @@ fn send_v2_secure_probe(
         ChannelRole::Initiator,
     )
     .map_err(invalid)?;
-    let proof: EncryptedFrame = read_json_line(&stream)?;
+    let proof: EncryptedFrame = read_json_line_from_reader(&mut reader)?;
     let plaintext = channel
         .open(&proof, b"secure-handshake-confirmation")
         .map_err(invalid)?;
@@ -802,6 +1491,18 @@ fn send_to_peer(
     total_bytes: u64,
     manager: &TransferManager,
 ) -> io::Result<()> {
+    #[cfg(feature = "swarm-v2")]
+    if std::env::var_os("ZAPDROP_SWARM_V2_DIRECT").is_some() {
+        return send_v2_direct(
+            identity,
+            store,
+            device_name,
+            peer,
+            sources,
+            policy,
+            transfer_id,
+        );
+    }
     #[cfg(feature = "swarm-v2")]
     if std::env::var_os("ZAPDROP_SWARM_V2_PROBE").is_some() {
         return send_v2_secure_probe(identity, store, device_name, peer, transfer_id);
@@ -1094,6 +1795,19 @@ fn existing_conflicts(directory: &str, manifest: &TransferManifest) -> Vec<Strin
         return Vec::new();
     };
     manifest
+        .items
+        .iter()
+        .filter(|item| root.join(&item.relative_path).exists())
+        .map(|item| item.relative_path.clone())
+        .collect()
+}
+
+#[cfg(feature = "swarm-v2")]
+fn existing_v2_conflicts(directory: &str, offer: &V2DirectOffer) -> Vec<String> {
+    let Ok(root) = safe_root(directory) else {
+        return Vec::new();
+    };
+    offer
         .items
         .iter()
         .filter(|item| root.join(&item.relative_path).exists())
@@ -1711,6 +2425,112 @@ mod tests {
                 .list()
                 .iter()
                 .any(|entry| entry.transfer_id == "transfer-a-to-b" && entry.status == "completed")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "swarm-v2")]
+    #[test]
+    fn secure_v2_direct_file_transfer_roundtrip() {
+        let root = std::env::temp_dir().join(format!("zapdrop-direct-v2-{}", uuid::Uuid::new_v4()));
+        let server_data = root.join("server-data");
+        let client_data = root.join("client-data");
+        let source = root.join("source.txt");
+        let received = root.join("received");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source, b"encrypted v2 direct transfer\n").unwrap();
+        let server_store = SettingsStore::new(server_data);
+        let client_store = SettingsStore::new(client_data);
+        let server_identity = DeviceIdentity::load_or_create(&server_store).unwrap();
+        let client_identity = DeviceIdentity::load_or_create(&client_store).unwrap();
+        let server_trust = TrustedPeerStore::load(&server_store).unwrap();
+        server_trust
+            .upsert(TrustedPeer {
+                version: 1,
+                peer_id: client_identity.device_id.clone(),
+                name: "Secure Client".to_string(),
+                public_key: client_identity.public_key.clone(),
+                fingerprint: client_identity.fingerprint.clone(),
+                first_seen: 1,
+                last_seen: 1,
+                endpoint: "127.0.0.1:0".to_string(),
+            })
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let mut context = test_context(
+            server_identity.clone(),
+            server_store.clone(),
+            server_trust,
+            received.clone(),
+            "Secure Server",
+        );
+        context.always_ask_before_receive = true;
+        let approval_offers = context.offers.clone();
+        let approval_context = context.clone();
+        let server = thread::spawn(move || {
+            let (stream, address) = listener.accept().unwrap();
+            let first: serde_json::Value = read_json_line(&stream).unwrap();
+            assert!(is_secure_hello(&first));
+            let _ = address;
+            handle_secure_incoming(stream, first, context);
+        });
+        let peer = PeerRecord {
+            id: server_identity.device_id.clone(),
+            name: "Secure Server".to_string(),
+            platform: "windows".to_string(),
+            fingerprint: Some(server_identity.fingerprint.clone()),
+            public_key: Some(server_identity.public_key.clone()),
+            endpoint: endpoint.to_string(),
+            port: endpoint.port(),
+            status: "trusted".to_string(),
+            discovered_via: "secure-v2-direct-test".to_string(),
+            last_seen: epoch_seconds(),
+            trusted: true,
+        };
+        let sender = thread::spawn({
+            let client_identity = client_identity.clone();
+            let client_store = client_store.clone();
+            let peer = peer.clone();
+            let source = source.clone();
+            move || {
+                send_v2_direct(
+                    &client_identity,
+                    &client_store,
+                    "Secure Client",
+                    &peer,
+                    &[TransferSource {
+                        path: source.to_string_lossy().to_string(),
+                        relative_path: Some("source.txt".to_string()),
+                    }],
+                    "rename",
+                    "secure-direct-file",
+                )
+            }
+        });
+        for _ in 0..20 {
+            if approval_offers
+                .list(&received.to_string_lossy())
+                .iter()
+                .any(|offer| offer.transfer_id == "secure-direct-file")
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        approval_offers
+            .accept(
+                "secure-direct-file",
+                "rename".to_string(),
+                None,
+                approval_context,
+            )
+            .unwrap();
+        sender.join().unwrap().unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            fs::read(received.join("source.txt")).unwrap(),
+            b"encrypted v2 direct transfer\n"
         );
         fs::remove_dir_all(root).unwrap();
     }
