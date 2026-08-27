@@ -17,6 +17,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::swarm::{EncryptedPieceHeader, SwarmJob, SWARM_PROTOCOL_VERSION};
 
+pub const SECURE_PROFILE_ID: &str = "x25519-hkdf-sha256-chacha20poly1305";
+pub const MAX_CHANNEL_FRAMES: u64 = 1 << 32;
+pub const MAX_CHANNEL_PLAINTEXT_BYTES: u64 = 1 << 40;
+
 const HANDSHAKE_KIND: &str = "zapdrop_secure_hello";
 const CHANNEL_DOMAIN: &str = "zapdrop/swarm/v2/channel";
 const JOB_KEY_DOMAIN: &str = "zapdrop/swarm/v2/job-key";
@@ -60,9 +64,11 @@ pub struct SecureHandshake {
     pub version: u32,
     pub session_id: String,
     pub device_id: String,
+    pub public_key: String,
     pub fingerprint: String,
     pub ephemeral_public_key: String,
     pub nonce: String,
+    pub supported_profiles: Vec<String>,
     pub timestamp: u64,
     pub signature: String,
 }
@@ -98,9 +104,11 @@ impl SecureHandshake {
             version: SWARM_PROTOCOL_VERSION,
             session_id,
             device_id,
+            public_key: encode_url(&signing_key.verifying_key().to_bytes()),
             fingerprint,
             ephemeral_public_key: encode_url(public.as_bytes()),
             nonce: encode_url(&nonce),
+            supported_profiles: vec![SECURE_PROFILE_ID.to_string()],
             timestamp,
             signature: String::new(),
         };
@@ -121,9 +129,17 @@ impl SecureHandshake {
         }
         validate_token("sessionId", &self.session_id)?;
         validate_token("deviceId", &self.device_id)?;
+        validate_bytes("publicKey", &self.public_key, Some(32))?;
         validate_token("fingerprint", &self.fingerprint)?;
         validate_bytes("ephemeralPublicKey", &self.ephemeral_public_key, Some(32))?;
         validate_bytes("nonce", &self.nonce, Some(32))?;
+        if !self
+            .supported_profiles
+            .iter()
+            .any(|profile| profile == SECURE_PROFILE_ID)
+        {
+            return Err(SecureError::Invalid("secure profile".to_string()));
+        }
         validate_bytes("signature", &self.signature, Some(64))?;
         if self.timestamp.abs_diff(now) > 5 * 60 {
             return Err(SecureError::Invalid("handshake timestamp".to_string()));
@@ -149,9 +165,11 @@ impl SecureHandshake {
             version: self.version,
             session_id: &self.session_id,
             device_id: &self.device_id,
+            public_key: &self.public_key,
             fingerprint: &self.fingerprint,
             ephemeral_public_key: &self.ephemeral_public_key,
             nonce: &self.nonce,
+            supported_profiles: &self.supported_profiles,
             timestamp: self.timestamp,
         })
         .expect("secure handshake fields are serializable")
@@ -165,9 +183,11 @@ struct HandshakeUnsigned<'a> {
     version: u32,
     session_id: &'a str,
     device_id: &'a str,
+    public_key: &'a str,
     fingerprint: &'a str,
     ephemeral_public_key: &'a str,
     nonce: &'a str,
+    supported_profiles: &'a [String],
     timestamp: u64,
 }
 
@@ -208,8 +228,13 @@ pub fn establish_channel(
     peer_handshake.verify(peer_verifying_key)?;
     let derived_fingerprint = public_key_fingerprint(peer_verifying_key);
     if peer_handshake.device_id != expected_peer_id
+        || peer_handshake.public_key != encode_url(&peer_verifying_key.to_bytes())
         || peer_handshake.fingerprint != expected_peer_fingerprint
         || peer_handshake.fingerprint != derived_fingerprint
+        || !peer_handshake
+            .supported_profiles
+            .iter()
+            .any(|profile| profile == SECURE_PROFILE_ID)
     {
         return Err(SecureError::AuthenticationFailed);
     }
@@ -243,6 +268,8 @@ pub fn establish_channel(
         receive_key: SecretKey::new(receive_key),
         next_send_sequence: 0,
         next_receive_sequence: 0,
+        sent_plaintext_bytes: 0,
+        received_plaintext_bytes: 0,
     })
 }
 
@@ -259,12 +286,17 @@ pub struct SecureChannel {
     receive_key: SecretKey,
     next_send_sequence: u64,
     next_receive_sequence: u64,
+    sent_plaintext_bytes: u64,
+    received_plaintext_bytes: u64,
 }
 
 impl SecureChannel {
     pub fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<EncryptedFrame, SecureError> {
         let sequence = self.next_send_sequence;
-        if sequence == u64::MAX {
+        if sequence >= MAX_CHANNEL_FRAMES
+            || self.sent_plaintext_bytes
+                > MAX_CHANNEL_PLAINTEXT_BYTES.saturating_sub(plaintext.len() as u64)
+        {
             return Err(SecureError::SequenceExhausted);
         }
         let nonce_bytes = sequence_nonce(sequence);
@@ -274,6 +306,9 @@ impl SecureChannel {
             .encrypt_in_place_detached(nonce, &channel_aad(sequence, aad), &mut ciphertext)
             .map_err(|_| SecureError::CryptographicFailure)?;
         self.next_send_sequence += 1;
+        self.sent_plaintext_bytes = self
+            .sent_plaintext_bytes
+            .saturating_add(plaintext.len() as u64);
         Ok(EncryptedFrame {
             sequence,
             ciphertext: encode_url(&ciphertext),
@@ -282,7 +317,7 @@ impl SecureChannel {
     }
 
     pub fn open(&mut self, frame: &EncryptedFrame, aad: &[u8]) -> Result<Vec<u8>, SecureError> {
-        if frame.sequence != self.next_receive_sequence {
+        if frame.sequence != self.next_receive_sequence || frame.sequence >= MAX_CHANNEL_FRAMES {
             return Err(SecureError::ReplayOrOutOfOrder);
         }
         let ciphertext = decode_url("frame ciphertext", &frame.ciphertext)?;
@@ -302,7 +337,15 @@ impl SecureChannel {
                 tag,
             )
             .map_err(|_| SecureError::AuthenticationFailed)?;
+        if self.received_plaintext_bytes
+            > MAX_CHANNEL_PLAINTEXT_BYTES.saturating_sub(plaintext.len() as u64)
+        {
+            return Err(SecureError::SequenceExhausted);
+        }
         self.next_receive_sequence += 1;
+        self.received_plaintext_bytes = self
+            .received_plaintext_bytes
+            .saturating_add(plaintext.len() as u64);
         Ok(plaintext)
     }
 }

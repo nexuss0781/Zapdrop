@@ -151,7 +151,14 @@ impl PairingCoordinator {
                                     Ok(value) => value,
                                     Err(error) => { let _ = write_json_line(&stream, &serde_json::json!({"kind":"zapdrop_protocol_error","error":error.to_string()})); return; }
                                 };
-                                if transfer::is_transfer_hello(&first) {
+                                #[cfg(feature = "swarm-v2")]
+                                if transfer::is_secure_hello(&first) {
+                                    if let Some(transfer) = context.transfer.clone() {
+                                        transfer::handle_secure_incoming(stream, first, transfer);
+                                    } else {
+                                        let _ = write_json_line(&stream, &serde_json::json!({"kind":"zapdrop_secure_error","status":"failed","reason":"secure transfer service is unavailable"}));
+                                    }
+                                } else if transfer::is_transfer_hello(&first) {
                                     if let Some(transfer) = context.transfer.clone() {
                                         transfer::handle_incoming(stream, address, first, transfer);
                                     } else {

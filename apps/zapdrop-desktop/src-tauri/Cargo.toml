@@ -38,3 +38,4 @@ zeroize = "1"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+swarm-v2 = []

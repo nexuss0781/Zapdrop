@@ -1,3 +1,5 @@
+#[cfg(feature = "swarm-v2")]
+use crate::secure::{establish_channel, ChannelRole, EncryptedFrame, SecureHandshake};
 use crate::{
     discovery::PeerRecord,
     history::{HistoryStore, TransferHistoryEntry},
@@ -544,8 +546,102 @@ impl TransferManager {
     }
 }
 
+pub fn is_secure_hello(value: &serde_json::Value) -> bool {
+    value.get("kind").and_then(|value| value.as_str()) == Some("zapdrop_secure_hello")
+}
+
 pub fn is_transfer_hello(value: &serde_json::Value) -> bool {
     value.get("kind").and_then(|value| value.as_str()) == Some(HELLO_KIND)
+}
+
+#[cfg(feature = "swarm-v2")]
+pub fn handle_secure_incoming(
+    stream: TcpStream,
+    first: serde_json::Value,
+    context: TransferServerContext,
+) {
+    let hello: SecureHandshake = match serde_json::from_value(first).map_err(invalid) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = write_error(&stream, &error.to_string());
+            return;
+        }
+    };
+    let trusted = context
+        .trust
+        .list()
+        .into_iter()
+        .find(|peer| peer.peer_id == hello.device_id && peer.fingerprint == hello.fingerprint);
+    let Some(trusted) = trusted else {
+        let _ = write_error(&stream, "secure sender is not trusted");
+        return;
+    };
+    let public_key_bytes = match BASE64.decode(&trusted.public_key).map_err(invalid) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = write_error(&stream, &error.to_string());
+            return;
+        }
+    };
+    let public_key_bytes: [u8; 32] = match public_key_bytes.try_into() {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = write_error(&stream, "trusted public key has invalid length");
+            return;
+        }
+    };
+    let peer_key = match VerifyingKey::from_bytes(&public_key_bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = write_error(&stream, &format!("invalid trusted public key: {error}"));
+            return;
+        }
+    };
+    let signing_key = match context.identity.signing_key(&context.store) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = write_error(&stream, &format!("could not load device identity: {error}"));
+            return;
+        }
+    };
+    let (response, ephemeral) = match SecureHandshake::create(
+        &signing_key,
+        hello.session_id.clone(),
+        context.identity.device_id.clone(),
+        context.identity.fingerprint.clone(),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = write_error(&stream, &error.to_string());
+            return;
+        }
+    };
+    if write_json_line(&stream, &response).is_err() {
+        return;
+    }
+    let mut channel = match establish_channel(
+        &ephemeral,
+        &response,
+        &hello,
+        &peer_key,
+        &trusted.peer_id,
+        &trusted.fingerprint,
+        ChannelRole::Responder,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = write_error(&stream, &error.to_string());
+            return;
+        }
+    };
+    let proof = match channel.seal(b"zapdrop-v2-secure-ready", b"secure-handshake-confirmation") {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = write_error(&stream, &error.to_string());
+            return;
+        }
+    };
+    let _ = write_json_line(&stream, &proof);
 }
 
 pub fn handle_incoming(
@@ -642,6 +738,58 @@ pub fn handle_incoming(
     let _ = address;
 }
 
+#[cfg(feature = "swarm-v2")]
+fn send_v2_secure_probe(
+    identity: &DeviceIdentity,
+    store: &SettingsStore,
+    device_name: &str,
+    peer: &PeerRecord,
+    session_id: &str,
+) -> io::Result<()> {
+    let address: SocketAddr = peer.endpoint.parse().map_err(invalid)?;
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(8))?;
+    stream.set_read_timeout(Some(Duration::from_secs(12)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(12)))?;
+    let signing_key = identity.signing_key(store)?;
+    let (hello, ephemeral) = SecureHandshake::create(
+        &signing_key,
+        session_id.to_string(),
+        identity.device_id.clone(),
+        identity.fingerprint.clone(),
+    )
+    .map_err(invalid)?;
+    write_json_line(&stream, &hello)?;
+    let peer_hello: SecureHandshake = read_json_line(&stream)?;
+    let encoded_public_key = peer
+        .public_key
+        .as_deref()
+        .ok_or_else(|| invalid("peer public key is unavailable"))?;
+    let public_key_bytes = BASE64.decode(encoded_public_key).map_err(invalid)?;
+    let public_key_bytes: [u8; 32] = public_key_bytes
+        .try_into()
+        .map_err(|_| invalid("peer public key has invalid length"))?;
+    let peer_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(invalid)?;
+    let mut channel = establish_channel(
+        &ephemeral,
+        &hello,
+        &peer_hello,
+        &peer_key,
+        &peer.id,
+        peer.fingerprint.as_deref().unwrap_or_default(),
+        ChannelRole::Initiator,
+    )
+    .map_err(invalid)?;
+    let proof: EncryptedFrame = read_json_line(&stream)?;
+    let plaintext = channel
+        .open(&proof, b"secure-handshake-confirmation")
+        .map_err(invalid)?;
+    if plaintext != b"zapdrop-v2-secure-ready" {
+        return Err(invalid("secure handshake proof mismatch"));
+    }
+    let _ = device_name;
+    Ok(())
+}
+
 fn send_to_peer(
     app: Option<&AppHandle>,
     identity: &DeviceIdentity,
@@ -654,6 +802,10 @@ fn send_to_peer(
     total_bytes: u64,
     manager: &TransferManager,
 ) -> io::Result<()> {
+    #[cfg(feature = "swarm-v2")]
+    if std::env::var_os("ZAPDROP_SWARM_V2_PROBE").is_some() {
+        return send_v2_secure_probe(identity, store, device_name, peer, transfer_id);
+    }
     let address: SocketAddr = peer.endpoint.parse().map_err(invalid)?;
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(8))?;
     stream.set_read_timeout(Some(Duration::from_secs(OFFER_TIMEOUT_SECS + 30)))?;
@@ -1560,6 +1712,70 @@ mod tests {
                 .iter()
                 .any(|entry| entry.transfer_id == "transfer-a-to-b" && entry.status == "completed")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "swarm-v2")]
+    #[test]
+    fn secure_v2_listener_probe_roundtrip() {
+        let root = std::env::temp_dir().join(format!("zapdrop-secure-v2-{}", uuid::Uuid::new_v4()));
+        let server_data = root.join("server-data");
+        let client_data = root.join("client-data");
+        fs::create_dir_all(&root).unwrap();
+        let server_store = SettingsStore::new(server_data);
+        let client_store = SettingsStore::new(client_data);
+        let server_identity = DeviceIdentity::load_or_create(&server_store).unwrap();
+        let client_identity = DeviceIdentity::load_or_create(&client_store).unwrap();
+        let server_trust = TrustedPeerStore::load(&server_store).unwrap();
+        server_trust
+            .upsert(TrustedPeer {
+                version: 1,
+                peer_id: client_identity.device_id.clone(),
+                name: "Secure Client".to_string(),
+                public_key: client_identity.public_key.clone(),
+                fingerprint: client_identity.fingerprint.clone(),
+                first_seen: 1,
+                last_seen: 1,
+                endpoint: "127.0.0.1:0".to_string(),
+            })
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let context = test_context(
+            server_identity.clone(),
+            server_store.clone(),
+            server_trust,
+            root.join("server-received"),
+            "Secure Server",
+        );
+        let server = thread::spawn(move || {
+            let (stream, _address) = listener.accept().unwrap();
+            let first: serde_json::Value = read_json_line(&stream).unwrap();
+            assert!(is_secure_hello(&first));
+            handle_secure_incoming(stream, first, context);
+        });
+        let peer = PeerRecord {
+            id: server_identity.device_id.clone(),
+            name: "Secure Server".to_string(),
+            platform: "windows".to_string(),
+            fingerprint: Some(server_identity.fingerprint.clone()),
+            public_key: Some(server_identity.public_key.clone()),
+            endpoint: endpoint.to_string(),
+            port: endpoint.port(),
+            status: "trusted".to_string(),
+            discovered_via: "secure-v2-test".to_string(),
+            last_seen: epoch_seconds(),
+            trusted: true,
+        };
+        send_v2_secure_probe(
+            &client_identity,
+            &client_store,
+            "Secure Client",
+            &peer,
+            "secure-session-v2",
+        )
+        .unwrap();
+        server.join().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
