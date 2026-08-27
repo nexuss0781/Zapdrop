@@ -1,9 +1,10 @@
 use crate::{
     discovery::{DiscoveryService, NetworkDiagnostics, PeerRecord},
+    history::HistoryStore,
     identity::DeviceIdentity,
     pairing::{PairingCoordinator, PairingOutcome, PairingRequestView},
     settings::{default_data_dir, AppSettings, SettingsStore},
-    transfer::{TransferManager, TransferRequest, TransferServerContext},
+    transfer::{ReceiveOfferCoordinator, TransferManager, TransferRequest, TransferServerContext},
     trust::{TrustedPeer, TrustedPeerStore},
 };
 use std::{collections::HashMap, io};
@@ -17,6 +18,8 @@ pub struct RuntimeState {
     pub pairing: Option<PairingCoordinator>,
     pub trust: TrustedPeerStore,
     pub transfer: TransferManager,
+    pub history: HistoryStore,
+    pub offers: ReceiveOfferCoordinator,
     pub discovery_error: Option<String>,
     pub pairing_error: Option<String>,
     pub manual_peers: HashMap<String, PeerRecord>,
@@ -28,6 +31,7 @@ impl RuntimeState {
         let settings = store.load()?;
         let identity = DeviceIdentity::load_or_create(&store)?;
         let trust = TrustedPeerStore::load(&store)?;
+        let history = HistoryStore::load(&store)?;
         let mut runtime = Self {
             store,
             settings,
@@ -35,7 +39,9 @@ impl RuntimeState {
             discovery: None,
             pairing: None,
             trust,
-            transfer: TransferManager::new(),
+            transfer: TransferManager::new(history.clone()),
+            history,
+            offers: ReceiveOfferCoordinator::new(),
             discovery_error: None,
             pairing_error: None,
             manual_peers: HashMap::new(),
@@ -93,6 +99,10 @@ impl RuntimeState {
             device_name: self.settings.device_name.clone(),
             receive_directory: self.settings.receive_directory.clone(),
             cancelled: self.transfer.cancelled.clone(),
+            history: self.history.clone(),
+            offers: self.offers.clone(),
+            always_ask_before_receive: self.settings.always_ask_before_receive,
+            default_conflict_policy: self.settings.default_conflict_policy.clone(),
         }
     }
 
@@ -136,6 +146,10 @@ impl RuntimeState {
         }
         peers.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
         peers
+    }
+
+    pub fn pending_transfers(&self) -> Vec<crate::transfer::IncomingTransferOffer> {
+        self.offers.list(&self.settings.receive_directory)
     }
 
     pub fn pending_pairings(&self) -> Vec<PairingRequestView> {

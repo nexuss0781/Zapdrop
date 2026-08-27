@@ -4,7 +4,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const SETTINGS_VERSION: u32 = 1;
+const SETTINGS_VERSION: u32 = 2;
+
+fn default_always_ask_before_receive() -> bool {
+    true
+}
+
+fn default_conflict_policy() -> String {
+    "rename".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -14,6 +22,10 @@ pub struct AppSettings {
     pub receive_directory: String,
     pub selected_interface: Option<String>,
     pub advertise_on_startup: bool,
+    #[serde(default = "default_always_ask_before_receive")]
+    pub always_ask_before_receive: bool,
+    #[serde(default = "default_conflict_policy")]
+    pub default_conflict_policy: String,
 }
 
 impl Default for AppSettings {
@@ -36,6 +48,8 @@ impl Default for AppSettings {
             receive_directory,
             selected_interface: None,
             advertise_on_startup: true,
+            always_ask_before_receive: true,
+            default_conflict_policy: default_conflict_policy(),
         }
     }
 }
@@ -141,6 +155,23 @@ mod tests {
         assert_eq!(normalize_device_name("\n\t"), "This PC");
         assert_eq!(normalize_device_name(" Desk\u{0000} PC "), "Desk PC");
         assert!(normalize_device_name(&"x".repeat(100)).len() <= 64);
+    }
+
+    #[test]
+    fn loads_legacy_settings_with_receive_defaults() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-legacy-settings-{}", uuid::Uuid::new_v4()));
+        let store = SettingsStore::new(root.clone());
+        store.ensure_root().unwrap();
+        fs::write(
+            store.settings_path(),
+            r#"{"version":1,"deviceName":"Legacy PC","receiveDirectory":"/tmp/zapdrop","selectedInterface":null,"advertiseOnStartup":true}"#,
+        )
+        .unwrap();
+        let loaded = store.load().unwrap();
+        assert!(loaded.always_ask_before_receive);
+        assert_eq!(loaded.default_conflict_policy, "rename");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

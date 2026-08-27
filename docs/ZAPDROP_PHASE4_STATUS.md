@@ -1,7 +1,7 @@
 # Zapdrop Phase 4 Status
 
-**Status:** Implemented; final verification and repository push pending  
-**Project:** standalone `nexuss0781/Zapdrop` private repository  
+**Status:** Implemented and pushed
+**Project:** standalone `nexuss0781/Zapdrop` private repository
 **Phase:** transfer engine, safe destination resolution, and parallel streaming
 
 ## Delivered
@@ -65,4 +65,4 @@ Phase 5 can begin with the following stable interfaces:
 4. `start_transfer` and `cancel_transfer` are available to the frontend.
 5. The receiver’s trust check and safe destination resolver must remain mandatory for every connection, including retries and manual endpoints.
 
-The next phase should replace the explicit source-path field with native file/folder selection, persist transfer history, add received-file notifications, and perform two-machine throughput and resume acceptance testing.
+Phase 5 implements native file/folder selection, local transfer history, and consent-gated receive offers. See `docs/ZAPDROP_PHASE5_STATUS.md` for its verification record, protocol sequence, and remaining two-machine acceptance and transport-hardening work.

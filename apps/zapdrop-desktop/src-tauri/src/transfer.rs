@@ -1,5 +1,6 @@
 use crate::{
     discovery::PeerRecord,
+    history::{HistoryStore, TransferHistoryEntry},
     identity::DeviceIdentity,
     pairing::{read_json_line, write_json_line},
     settings::SettingsStore,
@@ -32,6 +33,7 @@ const CANCEL_KIND: &str = "zapdrop_transfer_cancelled";
 const CHUNK_SIZE: usize = 1024 * 1024;
 const HELLO_ACCEPTED_KIND: &str = "zapdrop_transfer_hello_ok";
 const MAX_PARALLEL_RECIPIENTS: usize = 8;
+const OFFER_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -133,6 +135,193 @@ struct TransferControl {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomingTransferOffer {
+    pub transfer_id: String,
+    pub peer_id: String,
+    pub peer_name: String,
+    pub items: Vec<ManifestItem>,
+    pub total_bytes: u64,
+    pub conflict_policy: String,
+    pub default_receive_directory: String,
+    pub conflicts: Vec<String>,
+    pub received_at: u64,
+}
+
+struct PendingTransferOffer {
+    stream: TcpStream,
+    manifest: TransferManifest,
+    peer_id: String,
+    peer_name: String,
+    received_at: u64,
+}
+
+#[derive(Clone)]
+pub struct ReceiveOfferCoordinator {
+    pending: Arc<Mutex<HashMap<String, PendingTransferOffer>>>,
+}
+
+impl ReceiveOfferCoordinator {
+    pub fn new() -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn list(&self, default_directory: &str) -> Vec<IncomingTransferOffer> {
+        self.purge_expired();
+        self.pending
+            .lock()
+            .expect("pending transfer offers poisoned")
+            .values()
+            .map(|offer| IncomingTransferOffer {
+                transfer_id: offer.manifest.transfer_id.clone(),
+                peer_id: offer.peer_id.clone(),
+                peer_name: offer.peer_name.clone(),
+                items: offer.manifest.items.clone(),
+                total_bytes: offer.manifest.total_bytes,
+                conflict_policy: offer.manifest.conflict_policy.clone(),
+                default_receive_directory: default_directory.to_string(),
+                conflicts: existing_conflicts(default_directory, &offer.manifest),
+                received_at: offer.received_at,
+            })
+            .collect()
+    }
+
+    fn purge_expired(&self) {
+        let cutoff = epoch_seconds().saturating_sub(OFFER_TIMEOUT_SECS);
+        self.pending
+            .lock()
+            .expect("pending transfer offers poisoned")
+            .retain(|_, offer| offer.received_at >= cutoff);
+    }
+
+    fn insert(&self, offer: PendingTransferOffer) {
+        self.purge_expired();
+        self.pending
+            .lock()
+            .expect("pending transfer offers poisoned")
+            .insert(offer.manifest.transfer_id.clone(), offer);
+    }
+
+    pub fn accept(
+        &self,
+        transfer_id: &str,
+        policy: String,
+        destination: Option<String>,
+        context: TransferServerContext,
+    ) -> io::Result<()> {
+        let policy = normalize_conflict_policy(&policy)?;
+        let destination = destination.unwrap_or_else(|| context.receive_directory.clone());
+        let root = safe_root(&destination)?;
+        let pending = self
+            .pending
+            .lock()
+            .expect("pending transfer offers poisoned")
+            .remove(transfer_id)
+            .ok_or_else(|| invalid("incoming transfer offer expired"))?;
+        let mut offsets = HashMap::new();
+        for item in &pending.manifest.items {
+            offsets.insert(
+                item.item_id.clone(),
+                partial_offset(&root, &pending.manifest.transfer_id, item),
+            );
+        }
+        write_json_line(
+            &pending.stream,
+            &TransferReady {
+                kind: READY_KIND.to_string(),
+                version: TRANSFER_VERSION,
+                transfer_id: pending.manifest.transfer_id.clone(),
+                offsets,
+            },
+        )?;
+        let mut manifest = pending.manifest;
+        manifest.conflict_policy = policy;
+        let reader = BufReader::new(pending.stream.try_clone()?);
+        let started_at = epoch_seconds();
+        let source_names = manifest
+            .items
+            .iter()
+            .map(|item| item.relative_path.clone())
+            .collect::<Vec<_>>();
+        let _ = context.history.record(TransferHistoryEntry {
+            id: format!("{}:{}", manifest.transfer_id, pending.peer_id),
+            transfer_id: manifest.transfer_id.clone(),
+            direction: "receive".to_string(),
+            peer_id: pending.peer_id.clone(),
+            peer_name: pending.peer_name.clone(),
+            status: "started".to_string(),
+            source_names: source_names.clone(),
+            items: manifest.items.len(),
+            total_bytes: manifest.total_bytes,
+            bytes_done: 0,
+            conflict_policy: manifest.conflict_policy.clone(),
+            started_at,
+            finished_at: None,
+            error: None,
+        });
+        emit_progress(
+            &context.app,
+            &manifest.transfer_id,
+            &pending.peer_id,
+            &pending.peer_name,
+            "receive",
+            "started",
+            None,
+            0,
+            manifest.total_bytes,
+            0,
+            manifest.items.len(),
+            None,
+        );
+        thread::Builder::new()
+            .name(format!("zapdrop-receive-{}", manifest.transfer_id))
+            .spawn(move || {
+                let result = receive_items(
+                    reader,
+                    &root,
+                    &manifest,
+                    &context,
+                    &pending.peer_id,
+                    &pending.peer_name,
+                );
+                finish_received_transfer(
+                    &pending.stream,
+                    &context,
+                    &manifest,
+                    &pending.peer_id,
+                    &pending.peer_name,
+                    source_names,
+                    started_at,
+                    result,
+                );
+            })
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn reject(&self, transfer_id: &str, reason: String) -> io::Result<()> {
+        let pending = self
+            .pending
+            .lock()
+            .expect("pending transfer offers poisoned")
+            .remove(transfer_id)
+            .ok_or_else(|| invalid("incoming transfer offer expired"))?;
+        write_json_line(
+            &pending.stream,
+            &TransferControl {
+                kind: "zapdrop_transfer_rejected".to_string(),
+                version: TRANSFER_VERSION,
+                transfer_id: transfer_id.to_string(),
+                status: "rejected".to_string(),
+                reason: Some(reason),
+            },
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct TransferServerContext {
     pub app: AppHandle,
@@ -142,19 +331,25 @@ pub struct TransferServerContext {
     pub device_name: String,
     pub receive_directory: String,
     pub cancelled: Arc<Mutex<HashSet<String>>>,
+    pub history: HistoryStore,
+    pub offers: ReceiveOfferCoordinator,
+    pub always_ask_before_receive: bool,
+    pub default_conflict_policy: String,
 }
 
 #[derive(Clone)]
 pub struct TransferManager {
     pub cancelled: Arc<Mutex<HashSet<String>>>,
     active: Arc<Mutex<HashMap<String, usize>>>,
+    history: HistoryStore,
 }
 
 impl TransferManager {
-    pub fn new() -> Self {
+    pub fn new(history: HistoryStore) -> Self {
         Self {
             cancelled: Arc::new(Mutex::new(HashSet::new())),
             active: Arc::new(Mutex::new(HashMap::new())),
+            history,
         }
     }
 
@@ -236,6 +431,22 @@ impl TransferManager {
             .insert(transfer_id.clone(), selected.len());
         let item_count = manifest.len();
         for peer in selected {
+            let started_at = epoch_seconds();
+            let source_names = request
+                .sources
+                .iter()
+                .map(|source| {
+                    source.relative_path.clone().unwrap_or_else(|| {
+                        source
+                            .path
+                            .rsplit(['/', '\\'])
+                            .next()
+                            .unwrap_or(&source.path)
+                            .to_string()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let history = self.history.clone();
             let app = app.clone();
             let identity = identity.clone();
             let store = store.clone();
@@ -247,6 +458,22 @@ impl TransferManager {
                 .unwrap_or_else(|| "rename".to_string());
             let transfer_id = transfer_id.clone();
             let manager = manager.clone();
+            let _ = history.record(TransferHistoryEntry {
+                id: format!("{}:{}", transfer_id, peer.id),
+                transfer_id: transfer_id.clone(),
+                direction: "send".to_string(),
+                peer_id: peer.id.clone(),
+                peer_name: peer.name.clone(),
+                status: "started".to_string(),
+                source_names: source_names.clone(),
+                items: item_count,
+                total_bytes,
+                bytes_done: 0,
+                conflict_policy: policy.clone(),
+                started_at,
+                finished_at: None,
+                error: None,
+            });
             thread::Builder::new()
                 .name(format!("zapdrop-transfer-{}", peer.id))
                 .spawn(move || {
@@ -295,6 +522,12 @@ impl TransferManager {
                             error: Some(error.to_string()),
                         },
                     };
+                    let _ = history.record(history_entry(
+                        &progress,
+                        source_names.clone(),
+                        &policy,
+                        started_at,
+                    ));
                     let event = if progress.status == "completed" {
                         "transfer-complete"
                     } else if progress.status == "cancelled" {
@@ -375,116 +608,34 @@ pub fn handle_incoming(
         let _ = write_error(&stream, &error.to_string());
         return;
     }
-    let root = match safe_root(&context.receive_directory) {
-        Ok(root) => root,
-        Err(error) => {
-            let _ = write_error(&stream, &error.to_string());
-            return;
-        }
+    let received_at = epoch_seconds();
+    let offer = IncomingTransferOffer {
+        transfer_id: manifest.transfer_id.clone(),
+        peer_id: peer_id.clone(),
+        peer_name: peer_name.clone(),
+        items: manifest.items.clone(),
+        total_bytes: manifest.total_bytes,
+        conflict_policy: manifest.conflict_policy.clone(),
+        default_receive_directory: context.receive_directory.clone(),
+        conflicts: existing_conflicts(&context.receive_directory, &manifest),
+        received_at,
     };
-    let mut offsets = HashMap::new();
-    for item in &manifest.items {
-        offsets.insert(
-            item.item_id.clone(),
-            partial_offset(&root, &manifest.transfer_id, item),
+    let transfer_id = manifest.transfer_id.clone();
+    context.offers.insert(PendingTransferOffer {
+        stream,
+        manifest,
+        peer_id,
+        peer_name,
+        received_at,
+    });
+    let _ = context.app.emit("incoming-transfer-offer", offer);
+    if !context.always_ask_before_receive {
+        let _ = context.offers.accept(
+            &transfer_id,
+            context.default_conflict_policy.clone(),
+            None,
+            context.clone(),
         );
-    }
-    if write_json_line(
-        &stream,
-        &TransferReady {
-            kind: READY_KIND.to_string(),
-            version: TRANSFER_VERSION,
-            transfer_id: manifest.transfer_id.clone(),
-            offsets,
-        },
-    )
-    .is_err()
-    {
-        return;
-    }
-    emit_progress(
-        &context.app,
-        &manifest.transfer_id,
-        &peer_id,
-        &peer_name,
-        "receive",
-        "started",
-        None,
-        0,
-        manifest.total_bytes,
-        0,
-        manifest.items.len(),
-        None,
-    );
-    let result = receive_items(&mut reader, &root, &manifest, &context);
-    match result {
-        Ok(bytes) => {
-            let _ = write_json_line(
-                &stream,
-                &TransferControl {
-                    kind: COMPLETE_KIND.to_string(),
-                    version: TRANSFER_VERSION,
-                    transfer_id: manifest.transfer_id.clone(),
-                    status: "completed".to_string(),
-                    reason: None,
-                },
-            );
-            emit_progress(
-                &context.app,
-                &manifest.transfer_id,
-                &peer_id,
-                &peer_name,
-                "receive",
-                "completed",
-                None,
-                bytes,
-                manifest.total_bytes,
-                manifest.items.len(),
-                manifest.items.len(),
-                None,
-            );
-        }
-        Err(error) => {
-            let status = if context
-                .cancelled
-                .lock()
-                .expect("cancel set poisoned")
-                .contains(&manifest.transfer_id)
-            {
-                "cancelled"
-            } else {
-                "failed"
-            };
-            let _ = write_json_line(
-                &stream,
-                &TransferControl {
-                    kind: if status == "cancelled" {
-                        CANCEL_KIND
-                    } else {
-                        "zapdrop_transfer_error"
-                    }
-                    .to_string(),
-                    version: TRANSFER_VERSION,
-                    transfer_id: manifest.transfer_id.clone(),
-                    status: status.to_string(),
-                    reason: Some(error.to_string()),
-                },
-            );
-            emit_progress(
-                &context.app,
-                &manifest.transfer_id,
-                &peer_id,
-                &peer_name,
-                "receive",
-                status,
-                None,
-                0,
-                manifest.total_bytes,
-                0,
-                manifest.items.len(),
-                Some(error.to_string()),
-            );
-        }
     }
     let _ = address;
 }
@@ -503,7 +654,7 @@ fn send_to_peer(
 ) -> io::Result<()> {
     let address: SocketAddr = peer.endpoint.parse().map_err(invalid)?;
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(8))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(OFFER_TIMEOUT_SECS + 30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(15)))?;
     let hello = signed_hello(identity, store, device_name, transfer_id)?;
     write_json_line(&stream, &hello)?;
@@ -528,7 +679,14 @@ fn send_to_peer(
             conflict_policy: policy.to_string(),
         },
     )?;
-    let ready: TransferReady = read_json_line(&stream)?;
+    let ready_value: serde_json::Value = read_json_line(&stream)?;
+    if ready_value.get("kind").and_then(|value| value.as_str()) != Some(READY_KIND) {
+        let control: TransferControl = serde_json::from_value(ready_value).map_err(invalid)?;
+        return Err(invalid(control.reason.unwrap_or_else(|| {
+            "receiver did not accept the transfer".to_string()
+        })));
+    }
+    let ready: TransferReady = serde_json::from_value(ready_value).map_err(invalid)?;
     if ready.transfer_id != transfer_id {
         return Err(invalid("transfer ready response mismatch"));
     }
@@ -591,10 +749,12 @@ fn send_to_peer(
 }
 
 fn receive_items(
-    reader: &mut BufReader<TcpStream>,
+    mut reader: BufReader<TcpStream>,
     root: &Path,
     manifest: &TransferManifest,
     context: &TransferServerContext,
+    peer_id: &str,
+    peer_name: &str,
 ) -> io::Result<u64> {
     let mut total_done = 0u64;
     let mut completed = 0usize;
@@ -612,7 +772,7 @@ fn receive_items(
         }
         let mut offset = partial_offset(root, &manifest.transfer_id, item);
         while offset < item.size {
-            let chunk: TransferChunk = read_json_line_from_reader(reader)?;
+            let chunk: TransferChunk = read_json_line_from_reader(&mut reader)?;
             if chunk.kind != CHUNK_KIND
                 || chunk.transfer_id != manifest.transfer_id
                 || chunk.item_id != item.item_id
@@ -643,8 +803,8 @@ fn receive_items(
             emit_progress(
                 &context.app,
                 &manifest.transfer_id,
-                &context.identity.device_id,
-                &context.device_name,
+                peer_id,
+                peer_name,
                 "receive",
                 "transferring",
                 Some(item.relative_path.clone()),
@@ -676,8 +836,8 @@ fn receive_items(
         emit_progress(
             &context.app,
             &manifest.transfer_id,
-            &context.identity.device_id,
-            &context.device_name,
+            peer_id,
+            peer_name,
             "receive",
             "transferring",
             Some(item.relative_path.clone()),
@@ -690,6 +850,99 @@ fn receive_items(
     }
     let _ = fs::remove_dir_all(root.join(".zapdrop-partial").join(&manifest.transfer_id));
     Ok(total_done)
+}
+
+fn finish_received_transfer(
+    stream: &TcpStream,
+    context: &TransferServerContext,
+    manifest: &TransferManifest,
+    peer_id: &str,
+    peer_name: &str,
+    source_names: Vec<String>,
+    started_at: u64,
+    result: io::Result<u64>,
+) {
+    let (status, bytes_done, items_done, error) = match result {
+        Ok(bytes) => ("completed", bytes, manifest.items.len(), None),
+        Err(error) => {
+            let status = if context
+                .cancelled
+                .lock()
+                .expect("cancel set poisoned")
+                .contains(&manifest.transfer_id)
+            {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            (status, 0, 0, Some(error.to_string()))
+        }
+    };
+    let progress = TransferProgress {
+        transfer_id: manifest.transfer_id.clone(),
+        peer_id: peer_id.to_string(),
+        peer_name: peer_name.to_string(),
+        direction: "receive".to_string(),
+        status: status.to_string(),
+        current_path: None,
+        bytes_done,
+        total_bytes: manifest.total_bytes,
+        items_done,
+        total_items: manifest.items.len(),
+        error: error.clone(),
+    };
+    let _ = context.history.record(history_entry(
+        &progress,
+        source_names,
+        &manifest.conflict_policy,
+        started_at,
+    ));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+    let _ = write_json_line(
+        stream,
+        &TransferControl {
+            kind: if status == "completed" {
+                COMPLETE_KIND
+            } else if status == "cancelled" {
+                CANCEL_KIND
+            } else {
+                "zapdrop_transfer_error"
+            }
+            .to_string(),
+            version: TRANSFER_VERSION,
+            transfer_id: manifest.transfer_id.clone(),
+            status: status.to_string(),
+            reason: error.clone(),
+        },
+    );
+    let event = if status == "completed" {
+        "transfer-complete"
+    } else if status == "cancelled" {
+        "transfer-cancelled"
+    } else {
+        "transfer-failed"
+    };
+    let _ = context.app.emit(event, progress);
+}
+
+fn normalize_conflict_policy(policy: &str) -> io::Result<String> {
+    if matches!(policy, "rename" | "overwrite" | "skip") {
+        Ok(policy.to_string())
+    } else {
+        Err(invalid("unknown conflict policy"))
+    }
+}
+
+fn existing_conflicts(directory: &str, manifest: &TransferManifest) -> Vec<String> {
+    let Ok(root) = safe_root(directory) else {
+        return Vec::new();
+    };
+    manifest
+        .items
+        .iter()
+        .filter(|item| root.join(&item.relative_path).exists())
+        .map(|item| item.relative_path.clone())
+        .collect()
 }
 
 fn signed_hello(
@@ -771,6 +1024,7 @@ fn validate_manifest(manifest: &TransferManifest, transfer_id: &str) -> io::Resu
     {
         return Err(invalid("invalid transfer manifest"));
     }
+    normalize_conflict_policy(&manifest.conflict_policy)?;
     if manifest.items.len() > 100_000 {
         return Err(invalid("transfer contains too many items"));
     }
@@ -925,6 +1179,15 @@ fn destination_path(root: &Path, relative: &str, policy: &str) -> io::Result<Opt
             ));
         }
     }
+    if fs::symlink_metadata(&candidate)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "destination symlink is not allowed",
+        ));
+    }
     if candidate.exists() {
         match policy {
             "skip" => return Ok(None),
@@ -1024,6 +1287,30 @@ fn emit_progress(
         },
     );
 }
+fn history_entry(
+    progress: &TransferProgress,
+    source_names: Vec<String>,
+    policy: &str,
+    started_at: u64,
+) -> TransferHistoryEntry {
+    TransferHistoryEntry {
+        id: format!("{}:{}", progress.transfer_id, progress.peer_id),
+        transfer_id: progress.transfer_id.clone(),
+        direction: progress.direction.clone(),
+        peer_id: progress.peer_id.clone(),
+        peer_name: progress.peer_name.clone(),
+        status: progress.status.clone(),
+        source_names,
+        items: progress.total_items,
+        total_bytes: progress.total_bytes,
+        bytes_done: progress.bytes_done,
+        conflict_policy: policy.to_string(),
+        started_at,
+        finished_at: Some(epoch_seconds()),
+        error: progress.error.clone(),
+    }
+}
+
 fn read_json_line_from_reader<T: for<'de> Deserialize<'de>>(
     reader: &mut impl BufRead,
 ) -> io::Result<T> {

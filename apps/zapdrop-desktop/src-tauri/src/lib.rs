@@ -1,4 +1,6 @@
 mod discovery;
+mod explorer;
+mod history;
 mod identity;
 mod network;
 mod pairing;
@@ -45,6 +47,99 @@ pub struct SettingsPatch {
     pub receive_directory: Option<String>,
     pub selected_interface: Option<String>,
     pub advertise_on_startup: Option<bool>,
+    pub always_ask_before_receive: Option<bool>,
+    pub default_conflict_policy: Option<String>,
+}
+
+#[tauri::command]
+fn list_directory(path: Option<String>) -> Result<explorer::ExplorerLocation, String> {
+    explorer::list_directory(path)
+}
+
+#[tauri::command]
+fn inspect_sources(paths: Vec<String>) -> Result<Vec<explorer::SelectedSource>, String> {
+    explorer::inspect_sources(paths)
+}
+
+#[tauri::command]
+fn list_transfer_history(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<history::TransferHistoryEntry>, String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    Ok(runtime.history.list())
+}
+
+#[tauri::command]
+fn clear_transfer_history(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    runtime
+        .history
+        .clear()
+        .map_err(|error| format!("could not clear transfer history: {error}"))
+}
+
+#[tauri::command]
+fn list_pending_transfers(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<transfer::IncomingTransferOffer>, String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    Ok(runtime.pending_transfers())
+}
+
+#[tauri::command]
+fn accept_transfer(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+    conflict_policy: Option<String>,
+    destination: Option<String>,
+) -> Result<(), String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    runtime
+        .offers
+        .accept(
+            &transfer_id,
+            conflict_policy.unwrap_or_else(|| runtime.settings.default_conflict_policy.clone()),
+            destination,
+            runtime.transfer_context(&app),
+        )
+        .map_err(|error| format!("could not accept transfer: {error}"))?;
+    let _ = app.emit("incoming-transfer-accepted", transfer_id);
+    Ok(())
+}
+
+#[tauri::command]
+fn reject_transfer(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    runtime
+        .offers
+        .reject(
+            &transfer_id,
+            reason.unwrap_or_else(|| "rejected by user".to_string()),
+        )
+        .map_err(|error| format!("could not reject transfer: {error}"))?;
+    let _ = app.emit("incoming-transfer-rejected", transfer_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -91,6 +186,15 @@ fn update_settings(
     }
     if let Some(value) = patch.advertise_on_startup {
         runtime.settings.advertise_on_startup = value;
+    }
+    if let Some(value) = patch.always_ask_before_receive {
+        runtime.settings.always_ask_before_receive = value;
+    }
+    if let Some(value) = patch.default_conflict_policy {
+        if !matches!(value.as_str(), "rename" | "overwrite" | "skip") {
+            return Err("default conflict policy must be rename, overwrite, or skip".to_string());
+        }
+        runtime.settings.default_conflict_policy = value;
     }
     runtime
         .store
@@ -346,6 +450,7 @@ fn app_info(runtime: &RuntimeState) -> AppInfo {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let runtime = RuntimeState::boot(app.handle().clone())
                 .expect("failed to initialize Zapdrop runtime");
@@ -355,6 +460,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            list_directory,
+            inspect_sources,
+            list_transfer_history,
+            clear_transfer_history,
+            list_pending_transfers,
             get_app_info,
             get_settings,
             update_settings,
@@ -370,7 +480,9 @@ pub fn run() {
             reject_pairing,
             start_transfer,
             cancel_transfer,
-            revoke_trusted_peer
+            revoke_trusted_peer,
+            accept_transfer,
+            reject_transfer
         ])
         .run(tauri::generate_context!())
         .expect("error while running Zapdrop");
