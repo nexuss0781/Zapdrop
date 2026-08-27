@@ -1,147 +1,208 @@
-# Zapdrop Final Production Phases Roadmap
+# Zapdrop Grand Final Proposal: A Private Local Swarm for File Movement
 
-**Document status:** Design approved for implementation planning  
-**Current implementation:** Phases 1–5 complete  
-**Product goal:** Secure, direct, offline file sharing between trusted PCs on the same local area network, with predictable high-throughput transfers, concurrent multi-PC distribution, large-file recovery, and a realistic path beyond legacy Windows file sharing.
+**Document status:** Re-proposed after design review
+**Current implementation:** Phases 1–5 complete; encrypted payload transport and physical two-PC qualification remain outstanding
+**Product goal:** Move files and folders between trusted PCs over a private local network without internet, cloud storage, SMB shares, or a central service, while scaling from one-to-one transfer to secure one-to-many distribution.
 
-## 1. Product target
+## Executive proposal
 
-Zapdrop should be positioned as an **application-level local transfer network**, not as a replacement for SMB shared folders. SMB exposes a remote filesystem model that is useful for mounted shares but brings administrative permissions, share configuration, credential management, and legacy protocol behavior into the user experience. Zapdrop should instead provide a deliberate send workflow: discover nearby peers, verify identity, select local content, choose recipients, approve incoming offers, transfer directly, and commit verified files locally.
+Zapdrop should evolve from a conventional peer-to-peer file sender into a **private local content-distribution fabric**. The fundamental unit should no longer be “one TCP connection from one sender to one receiver.” It should be a signed **swarm job**: one immutable content snapshot, one authorized recipient set, one policy, and a scheduler that chooses direct, queued, or peer-assisted delivery for the local network.
 
-The core workflow must remain independent of a public internet connection, cloud account, relay service, domain controller, or centralized server. mDNS/DNS-SD is appropriate for zero-configuration local discovery because it is designed for DNS-like operations on a local link without conventional unicast DNS infrastructure and is intended to work with little administration [1]. Discovery must remain optional, however, because guest Wi-Fi networks, firewalls, VPNs, and hotspot implementations may block multicast. Manual private endpoint entry and an invitation-code path must remain first-class fallbacks.
+This changes the theory in four ways. First, membership is identity-first: a device is not in a swarm merely because it is visible on the LAN. It must be paired, trusted, authorized for the specific job, and able to prove possession of the expected content capability. Second, data is content-first: files and folders are represented by a verifiable snapshot and content-addressed pieces, not by a single fragile static path list. Third, distribution is group-first: the source coordinates a recipient set and may form a bounded tree or mesh instead of opening an unconstrained one-to-one session to every PC. Fourth, completion is proof-first: a destination is published only after the receiver verifies the complete content and the signed snapshot relationship.
 
-The current Phase 5 implementation already demonstrates the important product boundaries: pairing is explicit, trusted peers are required, incoming transfers are reviewed before writes, paths are validated in Rust, history is local, and the bidirectional CI test transfers one file in each direction concurrently. The next phases must turn that correctness foundation into a production-grade transport and performance system.
+The user’s proposals are valuable, but they should be introduced as **measured layers**, not as simultaneous replacements for the current reliable transfer path. TLS or Noise should protect the first secure transport. Merkle-style manifests should solve very large folder metadata. Direct fan-out should establish the one-to-many baseline. Tree-mesh distribution and RaptorQ repair should follow only after those foundations are correct. BBR should be benchmarked and selected by transport capability, not assumed to be universally faster. Onion routing should be optional because hiding IP addresses is a different threat model from encrypting payloads and adds relay, latency, abuse, and debugging complexity.
 
-## 2. Compatibility envelope
+## 1. Threat model and corrected security theory
 
-The current Tauri desktop client should have a narrow, supportable compatibility contract rather than an unverified promise for every historical Windows release. Tauri’s current documentation describes WebView2 as supported on Windows 7 and newer, while Microsoft’s current Edge support matrix lists supported Edge platforms beginning with Windows 10 SAC 1709 and selected LTSC editions [2] [3]. Tauri also requires Microsoft C++ Build Tools and WebView2 for Windows development, and states that WebView2 is already present on Windows 10 version 1803 onward [4].
+Zapdrop must treat a local network as potentially hostile. An attacker may observe traffic, inject frames, impersonate a discovered device, replay an old offer, alter a piece, exhaust connections, exploit path handling, or attempt to become an unauthorized relay. Encryption protects payload confidentiality, but it does not automatically hide IP addresses, traffic timing, device availability, or the fact that a transfer exists.
 
-Therefore, the recommended product contract is Windows 10 version 1803 or later for the maintained graphical client, with Windows 11 as the primary target. Windows 7 and 8.1 should not be called fully supported until a pinned WebView2/runtime combination, installer path, security update policy, and real hardware test matrix are proven. If those systems are strategically required, support should be delivered through a separately tested headless or minimal native companion that uses the same signed transfer protocol and does not depend on the modern WebView UI.
+### 1.1 Swarm membership is not discovery
 
-| Platform class | Product treatment | Required evidence |
+mDNS/DNS-SD remains a useful zero-configuration discovery mechanism because it is designed for DNS-like operations on a local link without conventional unicast DNS infrastructure [1]. Discovery must remain an untrusted observation only. A discovered peer receives no file metadata, piece, filesystem authority, or relay role until it completes the existing pairing and trust process and receives a job-specific authorization.
+
+The new security model should define three separate states: **visible**, **trusted**, and **authorized**. Visible means a peer announced a service or was entered manually. Trusted means both users approved a stable public-key binding. Authorized means that trusted identity was explicitly included in a particular swarm job, destination policy, and expiration window. This prevents the common mistake of treating LAN presence as permission.
+
+### 1.2 Encrypted transport and encrypted pieces
+
+The first secure implementation should place TLS 1.3 over the existing TCP framing, with the trusted device public key pinned into the certificate or handshake verification. TLS 1.3 is designed to prevent eavesdropping, tampering, and message forgery [2]. A Noise-style handshake can be evaluated later for a smaller protocol core or non-WebView companion, but Zapdrop should not maintain two independent security implementations before one is proven.
+
+Every swarm job should have a fresh job key and signed capability. The manifest, piece identifiers, recipient set, expiration, and allowed operations should be bound to that job. Pieces should be encrypted in transit by the session and may additionally be encrypted at rest in the staging cache. For peer-assisted distribution, forwarding peers should be able to serve authenticated ciphertext pieces without receiving filesystem authority or unrelated job keys. Each recipient receives the decryption capability only after authorization and policy approval. Rejection, expiration, cancellation, or revocation must invalidate the job capability.
+
+This is a more precise goal than “zero-knowledge swarm.” Cryptographic authentication and encrypted pieces can minimize trust and information disclosure, but they do not by themselves provide a zero-knowledge proof system or conceal network metadata. The product should use exact security claims: **authenticated peers, authorized jobs, encrypted payloads, integrity-verified pieces, and least-privilege relay capabilities**.
+
+### 1.3 Onion or garlic routing is an optional privacy mode
+
+A local privacy relay can hide the direct source-to-recipient relationship from ordinary peers, but it should not be the default LAN route. Multi-hop onion routing adds relay selection, path construction, latency, bandwidth amplification, failure handling, abuse controls, and a more complicated threat model. The Tor project documents onion-routing security as a separate topic with explicit residual attacks and limitations [10].
+
+Zapdrop should therefore expose three modes: **direct**, the default and fastest mode; **trusted relay**, an opt-in mode where selected trusted PCs forward encrypted pieces; and **privacy relay**, a later experimental mode for users who explicitly accept slower transfers and weaker operational visibility. The local network will still be able to observe endpoints and traffic patterns unless additional protections are implemented, so the UI must never promise complete anonymity.
+
+## 2. The swarm data model
+
+The protocol should introduce a versioned job model that can coexist with the current Phase 5 transfer records. The source creates a snapshot, derives a root content identifier, signs a job descriptor, and authorizes a recipient set. Receivers fetch or receive pieces, verify them against the snapshot, and publish only verified files.
+
+| Object | Contents | Security role |
 |---|---|---|
-| Windows 11 x64 | Primary supported GUI target | Clean install, offline install, private Wi-Fi, hotspot, wired LAN, firewall, sleep/wake, large-file tests |
-| Windows 10 1803+ x64 | Supported GUI target, subject to current WebView2/runtime availability | Versioned installer and WebView2 checks across supported editions |
-| Windows 10 LTSC editions | Supported only for explicitly tested editions | Clean-machine matrix and WebView2 installation policy |
-| Windows 7/8.1 | Compatibility evaluation or legacy companion target; not automatic GUI support | Pinned runtime, signed installer, IPv4/TLS test, no unsupported UI claims |
-| Windows XP/Vista and unsupported CPUs | Not supported | Clear installer and documentation rejection message |
-| macOS/Linux | Later portable-client targets | Native packaging, discovery, firewall, and filesystem-specific test matrix |
+| `SwarmJob` | Job ID, snapshot root, sender identity, recipient set, policy, expiry, topology mode | Binds the whole operation to an authorized group |
+| `SnapshotRoot` | Root hash of the folder/file graph, version, source metadata, creation time | Commits to the exact content view |
+| `DirectoryNode` | Sorted child names, types, metadata, child identifiers | Makes folder structure incrementally verifiable |
+| `FileObject` | File size, chunking profile, chunk identifiers, optional file digest | Describes a file without loading it into memory |
+| `Piece` | Content ID, job ID, sequence or symbol ID, length, ciphertext, authentication tag | Enables independent verification and relay |
+| `Capability` | Recipient, allowed object set, expiry, operation, signature | Prevents an authorized peer from becoming an unrestricted relay |
+| `TransferJournal` | Verified piece ranges, source fingerprint, destination, retry state | Enables safe resume and crash recovery |
 
-## 3. Final implementation phases
+The snapshot must be immutable for a job. If a source file changes after indexing, the sender must either create a new snapshot or explicitly restart the affected object. A receiver must never silently combine pieces from different snapshot roots.
 
-### Phase 6 — Encrypted authenticated transport
+## 3. One-to-many architecture
 
-**Objective.** Replace the current authenticated-but-plaintext TCP payload with a confidential transport while preserving the trusted-device identity model.
+### 3.1 Direct fan-out remains the correctness baseline
 
-The first implementation should use TLS 1.3 over the existing TCP connection. TLS 1.3 is designed to prevent eavesdropping, tampering, and message forgery [5]. Device identity keys should remain the trust anchor: the session certificate or public-key binding must be verified against the persisted trusted-peer record, not against a public certificate authority. The signed application hello should remain inside the protected session for protocol identity, transfer authorization, and replay checks.
+For a small recipient set, the source should open independent encrypted sessions with bounded concurrency. Each child session has its own authorization, rate, retry, cancellation, history, and completion proof. The parent job aggregates progress but never hides a failed recipient inside a successful aggregate. This preserves the current trusted-peer model and makes two, four, and eight-recipient behavior measurable.
 
-The phase must define certificate creation and rotation, peer-key changes, session resumption policy, protocol-version negotiation, downgrade rejection, handshake timeouts, and a clear no-plaintext-fallback rule. Debug logs must never expose private keys, session secrets, or complete file contents. QUIC should remain an optional later transport rather than a prerequisite: QUIC supplies secure multiplexed streams, flow control, loss recovery, congestion control, and path migration over UDP [6], but it also introduces UDP firewall and deployment behavior that should not delay a secure TCP baseline.
+The scheduler should expose a global bandwidth budget, per-recipient minimum service, active-session limit, queue priority, and slow-peer policy. A recipient that is offline or slow must not prevent other recipients from completing. A group cancellation must revoke the job capability and stop all child sessions, while cancel-one should affect only that recipient unless the user chooses to cancel the job.
 
-**Exit gate:** Packet capture confirms that file payloads are encrypted; an untrusted or key-changed peer cannot complete the session; replayed hellos fail; a TLS or identity failure leaves no file presented as complete; and the existing one-to-one and multi-recipient tests pass unchanged at the application layer.
+### 3.2 Tree-mesh distribution is the scale-out mode
 
-### Phase 7 — LAN connectivity, firewall, and network resilience
+When source upload becomes the bottleneck, Zapdrop should choose a bounded distribution topology. The source seeds verified pieces to a small number of high-capacity trusted peers. Those peers forward authorized ciphertext pieces to their assigned children. The structure should be a dynamic tree with controlled mesh repair: a receiver may have one preferred parent and a limited number of alternate peers for missing pieces.
 
-**Objective.** Make discovery and connectivity predictable across Wi-Fi, Ethernet, hotspots, multiple interfaces, IPv4, IPv6, and multicast-blocked networks.
+Topology selection should use measured properties, not device labels alone. Candidate inputs include observed throughput, round-trip time, loss or retry rate, available disk space, CPU cost, user relay consent, and whether the device is metered or battery constrained. The source remains the policy authority and can revoke a branch. A peer must not forward to a device outside the authorized recipient set.
 
-The runtime should model interfaces explicitly and advertise only on eligible private interfaces selected by policy. Each peer record should retain the identity binding separately from changing addresses. Discovery should debounce duplicate events, expire stale records, handle address changes, and display why a candidate is unavailable. The manual fallback should validate private/link-local endpoints, test connectivity with a signed probe, and never imply that disabling the firewall is an acceptable fix.
+| Mode | Default status | Best use | Main risk |
+|---|---|---|---|
+| Direct bounded fan-out | Default | Up to a few recipients and heterogeneous networks | Source upload amplification |
+| Queued fan-out | Supported | More recipients than active-session budget | Longer completion time |
+| Tree distribution | Opt-in after qualification | Many recipients on a fast local network | Branch failure and relay abuse |
+| Mesh repair | Opt-in inside tree jobs | Recovering missing pieces without returning to source | Duplicate traffic and authorization complexity |
+| Privacy relay | Experimental | Users prioritizing relationship hiding over speed | Latency, relay cost, and incomplete anonymity |
 
-The Windows installer should register the narrowest inbound firewall rule possible for Zapdrop on private networks, with a diagnostics page that tests listener reachability and reports whether the active network is public, private, hotspot, or VPN-backed. The product should not rely on SMB ports, Windows shared folders, mapped drives, administrator shares, or domain credentials.
+### 3.3 Fountain and repair coding
 
-**Exit gate:** Two real PCs discover and connect over wired LAN, private Wi-Fi, and a phone hotspot; multicast-blocked networks work through manual fallback; IPv4 works even when IPv6 is unavailable; an address change does not break trust; and no VPN or public interface is advertised unintentionally.
+RaptorQ is a suitable candidate for the repair layer because RFC 6330 specifies it for reliable object delivery and describes a systematic fountain code that can generate encoding symbols on demand and recover a source block from almost any sufficient set [4]. It should not replace the reliable baseline for every transfer. For a clean wired LAN, acknowledged source pieces plus selective retransmission will usually be easier to debug and may be more efficient than encoding every byte.
 
-### Phase 8 — Transfer engine v2 and throughput tuning
+The recommended design is **systematic blocks with optional repair symbols**. Send original pieces first. Generate repair symbols only when loss, branch churn, or multi-recipient demand makes them cheaper than repeated retransmission. Use a bounded source block size, cap repair overhead, and verify reconstruction against the file object and snapshot root. RaptorQ belongs primarily in tree/mesh mode, high-loss hotspots, and branch repair—not in the first secure one-to-one path.
 
-**Objective.** Increase throughput without sacrificing integrity, fairness, bounded resource use, or cancellation behavior.
+## 4. Massive files and folders
 
-The transfer engine should be measured against a network baseline such as `iperf3` or an equivalent controlled throughput reference. The implementation should use bounded asynchronous I/O, reusable buffers, explicit backpressure, configurable chunk sizes, and separate control from payload scheduling. Chunk sizes should adapt within a safe range based on measured bandwidth-delay behavior rather than using an unbounded memory queue. Hashing should be streamed and parallelized only when measurements show that CPU hashing is the bottleneck.
+### 4.1 Merkle-DAG-inspired snapshots
 
-The tuning process must measure single-file, multi-file, mixed-size, encrypted, and concurrent-recipient workloads. Results should record effective throughput, CPU, memory, disk write rate, time to first byte, total completion time, retransmitted or retried bytes, and fairness across recipients. The target is not a universal megabytes-per-second promise; the acceptance target is a stable percentage of the measured single-stream LAN baseline on the same machine and network.
+The folder index should evolve from a single eager manifest into a Merkle-style snapshot graph. IPFS documentation describes Merkle-DAG nodes as content-addressed, immutable, self-verifying structures whose identifiers commit to node payloads and descendants [5]. Zapdrop should adapt this idea locally without joining the public IPFS network or requiring a DHT.
 
-| Workload | Required measurement | Initial acceptance target |
+Directory nodes should hash a canonical, sorted list of child descriptors. File objects should reference chunk identifiers and size metadata. Unchanged subtrees can be reused between snapshots, allowing incremental re-send and rapid comparison. The source should stream index pages and permit the receiver to request only the directory or file objects needed for the chosen destination policy. Millions of entries must not require a single in-memory JSON document.
+
+### 4.2 Chunking and storage rules
+
+Start with a measured fixed chunk profile, such as 4 MiB for ordinary files, and evaluate adaptive profiles in a bounded range such as 1–16 MiB. Network pieces should not be blindly aligned to filesystem cluster size: filesystem allocation units, network MTU, encryption records, and application buffering solve different problems. Alignment may be an optimization in a specific storage backend, but it must be demonstrated by benchmarks rather than assumed.
+
+The staging store should be content-addressed within a job or device scope, use 64-bit offsets, maintain a verified-piece bitmap or range set, and support sequential or sparse writes according to filesystem capability. The final file should be atomically published only after the object digest and snapshot relationship are verified. Stale journals and partial directories require bounded cleanup, and cancellation must never expose a partial file as complete.
+
+### 4.3 Large-file resume contract
+
+A resume is valid only if the source snapshot root, file object identifier, chunking profile, destination policy, and authorized job still match. The journal must detect source mutation, disk-full conditions, permission changes, sleep/wake interruptions, and destination conflicts. A 4 GB-plus test file is the minimum qualification case; production qualification should include multi-hundred-gigabyte fixtures and large sparse or highly fragmented folder trees.
+
+## 5. Throughput and congestion control
+
+Zapdrop should measure throughput against a controlled LAN baseline rather than advertise a universal speed number. Metrics should include effective payload throughput, time to first byte, aggregate and per-recipient throughput, CPU, memory, disk write rate, retransmitted bytes, repair overhead, queueing delay, and fairness.
+
+BBR is a valid experiment because its design models delivery rate, round-trip time, and loss and controls pacing and in-flight volume [6]. However, an application cannot simply “modify TCP to BBR” in a portable way. BBR selection depends on the operating system, kernel, socket API, or userspace transport. Zapdrop should first benchmark the platform default, then evaluate BBR where the chosen transport exposes it, and record results on wired, Wi-Fi, hotspot, and lossy networks. QUIC is a later option because it supplies secure multiplexed streams, flow control, loss recovery, congestion control, and path migration over UDP [3], but UDP deployment and firewall behavior must be proven before it becomes a required transport.
+
+| Benchmark family | Required comparison | Release decision |
 |---|---|---|
-| One 4–16 GB file, wired LAN | Effective payload throughput and final hash | At least 80% of the controlled single-stream LAN baseline after warm-up |
-| One 4–16 GB file, Wi-Fi | Throughput, retries, sleep/wake behavior | No corruption; performance baseline recorded for each test AP/hotspot |
-| 10,000 small files | Metadata overhead and time to first payload | Bounded manifest memory and no UI freeze; target refined from baseline |
-| Two and four recipients | Aggregate throughput and per-recipient fairness | One slow peer cannot indefinitely starve the others |
-| Eight recipients | Resource ceiling and partial success | Bounded sockets, buffers, handles, and disk queue; independent outcomes |
-| TLS-enabled transfers | Encryption overhead | Measured regression documented and accepted before release |
+| Single 4–16 GB file | Plain baseline versus encrypted transport | Encryption regression is measured and accepted |
+| Two-way simultaneous transfer | A→B and B→A fairness | Neither direction starves the other |
+| Two, four, and eight recipients | Direct fan-out aggregate rate | Resource limits and partial success remain correct |
+| Tree/mesh job | Source upload reduction versus duplicate traffic | Improvement is measured, not assumed |
+| RaptorQ repair | Retransmission bytes versus CPU and repair overhead | Enabled only where net benefit is demonstrated |
+| BBR/default congestion control | Throughput, latency, fairness, loss | Selected per supported transport/platform, not by slogan |
 
-**Exit gate:** The performance test suite is repeatable, the encrypted path meets the agreed baseline, memory does not grow with file size, cancellation remains responsive, and a slow or disconnected recipient cannot corrupt or stall successful recipients.
+## 6. Revised final implementation phases
 
-### Phase 9 — Multi-PC distribution and peer-assisted sharing
+### Phase 6 — Swarm protocol v2 and encrypted piece plane
 
-**Objective.** Make large fan-out transfers efficient and understandable when one source sends to many PCs.
+**Objective:** Define the group-job protocol and close the current plaintext-payload gap.
 
-The default mode should remain **direct bounded fan-out**: the source opens independent sessions to selected trusted recipients, each with its own progress, retry, cancellation, and history. This is the safest model and matches the current Phase 4/5 design. The scheduler should support per-recipient priorities, a global bandwidth cap, a maximum active-recipient count, and a queue for additional recipients.
+Implement `SwarmJob`, snapshot roots, signed recipient capabilities, protocol-version negotiation, TLS 1.3 with pinned device identity, fresh job keys, encrypted piece framing, replay protection, key rotation, and no plaintext fallback. Preserve the current pairing and safe-path boundaries. Add parser limits, capability expiry, cancellation revocation, and redacted diagnostics.
 
-A second opt-in mode can reduce source upload amplification for large groups through **peer-assisted distribution**. In this mode the source sends verified chunks to a small set of trusted seed peers, and additional recipients fetch chunks from those peers over separately authorized sessions. Every chunk must remain content-addressed and hash-verified, and each forwarding authorization must be scoped to the original transfer, item, recipient set, expiry, and sender identity. No peer should become an implicit relay for unrelated devices, and the source must be able to revoke or stop the distribution.
+**Acceptance gate:** Packet capture shows no readable file payload; a visible-but-untrusted peer cannot obtain a manifest or piece; a revoked recipient cannot continue; and wrong-key, replay, malformed-frame, and key-change tests fail safely.
 
-| Distribution mode | Use case | Security and reliability rule |
+### Phase 7 — Content-addressed snapshot and large-dataset engine
+
+**Objective:** Replace eager monolithic manifests with streaming, incremental, verifiable folder snapshots.
+
+Implement canonical directory nodes, file chunk objects, snapshot roots, paged metadata exchange, deduplication within a job, Unicode and path normalization, millions-of-entry stress tests, 64-bit file sizes, disk-space preflight, staging journals, crash recovery, source-change detection, and atomic finalization.
+
+**Acceptance gate:** A large folder can be indexed and transferred without memory scaling with total dataset size; unchanged subtrees are reused; a 4 GB-plus file resumes after termination; and altered source content cannot silently merge into an old job.
+
+### Phase 8 — One-to-many scheduler and direct swarm mode
+
+**Objective:** Make group transfer the primary product abstraction.
+
+Implement parent jobs and recipient child sessions, global bandwidth and resource budgets, per-recipient fairness, queued recipients, per-peer retry/cancel, aggregate progress, partial-success semantics, and group history. The default direct mode should support at least two, four, and eight trusted recipients and simultaneous transfers in both directions.
+
+**Acceptance gate:** One source can complete a mixed file/folder job to multiple recipients; one failure does not affect successful peers; slow peers do not starve the group; and all child outcomes reconcile correctly into the parent history.
+
+### Phase 9 — Tree-mesh and peer-assisted distribution
+
+**Objective:** Reduce source upload amplification for large groups while preserving least privilege.
+
+Implement capability-scoped forwarding, topology measurement, branch assignment, parent failover, alternate-peer repair, relay consent, global job revocation, and per-branch observability. Start with encrypted original pieces forwarded as ciphertext. Do not allow arbitrary relay requests or recipients outside the signed job set.
+
+**Acceptance gate:** A tree job measurably reduces source upload for a defined multi-PC topology; a failed parent is repaired without corrupting the snapshot; a relay cannot access unrelated files; and direct fan-out remains available as a fallback.
+
+### Phase 10 — Fountain repair and adaptive throughput
+
+**Objective:** Add repair coding and congestion-control adaptation only where measurements justify them.
+
+Implement systematic source blocks, bounded RaptorQ repair-symbol generation, receiver reconstruction, repair-overhead accounting, adaptive chunk profiles, backpressure, and transport-specific congestion-control experiments. Benchmark default TCP behavior, BBR where available, and a future QUIC prototype independently. Keep the reliable direct path as the reference implementation.
+
+**Acceptance gate:** Repair coding lowers completion time or source amplification on selected loss/mesh workloads without unacceptable CPU or memory cost; ordinary clean-LAN transfers do not regress; and the chosen congestion strategy is documented per platform.
+
+### Phase 11 — Legacy Windows companion and cross-platform protocol
+
+**Objective:** Extend the protocol beyond the modern Tauri GUI without inheriting SMB’s shared-filesystem assumptions.
+
+Maintain the Windows 10 1803+ and Windows 11 Tauri GUI as the primary supported client. Tauri documents WebView2 and native build prerequisites for Windows [7] [9], while Microsoft’s current Edge support matrix identifies Windows 10 SAC 1709 and later selected editions and Windows 11 as supported Edge platforms [8]. For Windows 7/8.1, build a separately tested minimal native companion only if real users require it. The companion should provide the signed listener, pairing, receive approval, and send/receive commands without depending on the modern WebView. It must share the same protocol version, snapshot, piece, capability, and journal contracts.
+
+Add Linux x64/ARM64 and macOS Intel/Apple Silicon targets after the protocol is stable. Do not map drives, expose SMB shares, require domain credentials, or silently grant a remote filesystem browser. The differentiator is deliberate, authorized content movement rather than a new shared-folder administration surface.
+
+**Acceptance gate:** A modern Windows client exchanges content with the companion using encrypted, version-negotiated protocol; installation and runtime prerequisites are reported clearly; upgrades preserve trust and history according to migration policy; and unsupported operating systems receive an honest compatibility message.
+
+### Phase 12 — Physical-LAN qualification, privacy modes, and stable release
+
+**Objective:** Prove the grand design on real networks and publish a supportable product.
+
+Use at least two physical PCs, a wired LAN, a home Wi-Fi router, a phone hotspot, a guest or multicast-blocked network, a restrictive firewall, a VPN-enabled machine, and a low-end or older Windows system. Exercise discovery fallback, trust revocation, encrypted one-to-one transfer, simultaneous bidirectional transfer, two/four/eight-recipient fan-out, tree/mesh mode, repair coding, large-file resume, source mutation, disk-full, cancellation, sleep/wake, and malicious or malformed peers.
+
+The release must include signed or explicitly classified unsigned artifacts, installer and portable options where supported, firewall guidance limited to private networks, WebView2/runtime behavior, protocol version, compatibility matrix, performance report, known limitations, rollback instructions, and a security review. Privacy relay should remain experimental until its threat model, relay abuse controls, and metadata claims are independently reviewed.
+
+**Acceptance gate:** The physical-LAN matrix passes; critical and high security findings are closed; measured encrypted throughput and resource ceilings are published; large-file resume is reliable; and a clean supported machine can install, operate offline, transfer, upgrade, roll back, and uninstall predictably.
+
+## 7. What Zapdrop deliberately does not become
+
+| Temptation | Decision | Reason |
 |---|---|---|
-| Direct fan-out | Two to eight recipients; default | Independent sessions and independent outcomes |
-| Queued fan-out | More recipients than the active limit | Explicit queue, aggregate progress, no hidden auto-sharing |
-| Peer-assisted | Large files and many trusted recipients | Opt-in, signed chunk authorization, verified chunks, revocable transfer scope |
-| Offline bundle/export | No simultaneous connectivity | Encrypted, integrity-checked package with explicit import approval |
+| Anonymous LAN swarm | Reject | Discovery is not authorization; it would weaken the trust boundary |
+| SMB replacement or drive mapper | Reject | It recreates shared-filesystem permissions and legacy administration problems |
+| Mandatory onion routing | Reject | It adds latency and relay complexity without solving the primary payload-security need |
+| Mandatory RaptorQ for all files | Reject | It adds CPU and implementation complexity where retransmission is sufficient |
+| Hard-coded BBR promise | Reject | Congestion-control availability and results depend on transport and platform |
+| One giant JSON manifest | Reject | It does not scale to millions of entries or incremental updates |
+| Unrestricted peer relay | Reject | Forwarding must be scoped to a signed job, recipient set, and expiry |
+| Silent overwrite or auto-accept | Reject | User consent, conflict policy, and safe finalization are product requirements |
 
-**Exit gate:** Two, four, and eight trusted recipients can receive the same selection concurrently; one failure does not affect successful recipients; aggregate and per-peer history are correct; peer-assisted mode is disabled by default until security and fairness tests pass.
+## 8. Final definition of success
 
-### Phase 10 — Large-file resumability and storage reliability
+Zapdrop succeeds when several trusted PCs can join the same private local job without internet access, exchange an immutable content snapshot, and distribute large files or folders through the fastest safe topology available. A user can send from one source to many recipients while another peer sends back at the same time. Each peer sees its own authorization, progress, destination, integrity result, retry state, and history. A tree or mesh can reduce repeated source uploads, but no relay can escape its capability scope. A repair-coded transfer can recover from loss, but no receiver can publish content without a verified snapshot proof.
 
-**Objective.** Make transfers reliable for files larger than 4 GB and for interrupted sessions, without loading whole files into memory or exposing partial output.
-
-The wire protocol and persistence schema must use unsigned 64-bit byte offsets and lengths everywhere. A transfer journal should record the transfer ID, source fingerprint, item ID, destination, completed chunk ranges, digest state, selected policy, and last verified checkpoint. Resume must be allowed only when the source identity and manifest still match; otherwise Zapdrop must restart or require explicit user confirmation. The receiver should use staging files under the existing protected partial directory, flush according to a documented durability policy, verify the final digest, and atomically publish the destination.
-
-Storage management should include preflight free-space estimates, sparse-file or sequential-write policy by filesystem, stale-partial cleanup, disk-full recovery, permission and read-only handling, path-length and Unicode tests, reparse-point/symlink rejection, and safe behavior when a destination changes during transfer. History must distinguish completed, interrupted, resumed, cancelled, failed, skipped, and partially successful states.
-
-**Exit gate:** A 4 GB-plus file and a multi-hundred-gigabyte test fixture can resume after process termination or network loss; a changed source cannot silently resume into a corrupt destination; disk-full and permission failures are recoverable; and no staging file is shown as a completed user file.
-
-### Phase 11 — Legacy Windows companion and cross-platform packaging
-
-**Objective.** Extend the useful life of the transfer protocol without pretending that every historical Windows GUI can provide the same experience.
-
-The protocol should be versioned independently from the React/Tauri UI. A minimal native companion can provide a signed listener, pairing/import, receive approval through a console or simple native dialog, and send/receive operations over IPv4 TCP. It should share the identity, trust, manifest, checksum, and resume contracts with the main client. The companion must not silently expose a general filesystem share and must have an explicit receive root and approval policy.
-
-For supported modern Windows, the release package should include an installer, a portable build where practical, WebView2 detection or offline installation policy, firewall guidance, code signing, upgrade migration, and uninstall behavior. For Windows 7/8.1, a separate compatibility build must use a pinned dependency set and be tested on clean machines; if the security or runtime support cannot be maintained, the release must clearly classify those versions as unsupported rather than silently shipping a broken GUI.
-
-**Exit gate:** The modern installer works offline on the supported Windows matrix; the portable build reports missing runtime dependencies clearly; the companion can exchange files with the modern client using the same secure protocol; upgrades preserve trust/history according to policy; and no package depends on SMB configuration.
-
-### Phase 12 — Physical-LAN qualification, security review, and stable release
-
-**Objective.** Validate the product on real networks and publish a measured, supportable release.
-
-The qualification lab should include at least two physical Windows PCs, one phone hotspot, one home Wi-Fi router, one wired switch, one multicast-blocked or guest network, one VPN-enabled machine, and a machine with restrictive firewall policy. The test plan should include first pairing, revocation, key change, one-to-one transfer, simultaneous bidirectional transfer, two/four/eight-recipient fan-out, large-file resume, sleep/wake, cancellation, conflict policies, disk-full handling, source mutation, malformed manifests, and untrusted-peer attempts.
-
-The security review should cover the TLS implementation, trust-store migration, parser fuzzing, manifest limits, resource exhaustion, path handling, reparse points, logging, dependency audit, installer integrity, update signing, and rollback. A release candidate should publish its protocol version, supported operating systems, known limitations, measured performance, checksum/signature information, and a reproducible test report.
-
-**Exit gate:** The physical-LAN matrix passes; the security review has no unresolved critical or high findings; release artifacts are signed or clearly marked unsigned for internal builds; performance results are published; and the product can be installed, used offline, upgraded, rolled back, and uninstalled without losing data unexpectedly.
-
-## 4. Recommended implementation order
-
-The next implementation milestone should be **Phase 6: encrypted authenticated transport**. It is the highest-priority gap because the current Zapdrop transport authenticates peers and verifies content but does not provide payload confidentiality. Phase 7 should follow immediately so transport changes are validated on real LAN topologies before performance work begins.
-
-After that, implement Phase 8 throughput tuning and Phase 9 multi-PC scheduling as separate milestones. This preserves a measurable one-to-one baseline before adding peer-assisted distribution. Phase 10 should then harden large-file recovery, followed by Phase 11 compatibility packaging and Phase 12 physical qualification.
-
-| Priority | Phase | Reason |
-|---:|---|---|
-| 1 | Phase 6 — Encrypted transport | Closes the current plaintext-payload security gap |
-| 2 | Phase 7 — LAN resilience | Proves operation beyond the loopback and CI environment |
-| 3 | Phase 8 — Throughput | Establishes measurable, encrypted performance |
-| 4 | Phase 9 — Multi-PC distribution | Scales the validated engine to concurrent recipients |
-| 5 | Phase 10 — Large-file recovery | Makes the product dependable for real archives and media |
-| 6 | Phase 11 — Legacy companion and packaging | Extends reach without weakening the modern product contract |
-| 7 | Phase 12 — Qualification and release | Converts engineering capability into a supported product |
-
-## 5. Definition of the final goal
-
-Zapdrop reaches its final product goal when a user can place two or more PCs on the same private LAN or hotspot, open the app without internet access, discover or manually connect to peers, verify trust, send one or more files or folders to several recipients, and receive files in the opposite direction at the same time. Each transfer must be encrypted, integrity-checked, resumable, independently cancellable, visible in history, and safe against path traversal, symlink/reparse-point escape, untrusted peers, disk failure, and partial output exposure.
-
-The product succeeds by being **simpler and safer than shared folders for deliberate file movement**, not by reproducing every SMB feature. It should provide direct local movement, clear consent, multi-PC concurrency, reliable large-file handling, and a compatibility story that is honest about the difference between a supported modern GUI and a separately maintained legacy companion.
+This architecture transcends legacy Windows file sharing by replacing implicit shared-folder authority with explicit job authority, replacing path-centric copies with verifiable content objects, replacing one-to-one assumptions with bounded group scheduling, and replacing “the file appeared” with cryptographic completion proof. It remains honest about its limits: encryption can protect content without hiding all network metadata, CI loopback tests cannot replace physical-LAN qualification, and legacy operating systems require a separately supported compatibility profile rather than a broken modern GUI.
 
 ## References
 
 [1]: https://datatracker.ietf.org/doc/html/rfc6762 "RFC 6762 - Multicast DNS"
-[2]: https://v2.tauri.app/reference/webview-versions/ "Tauri Webview Versions"
-[3]: https://learn.microsoft.com/en-us/deployedge/microsoft-edge-supported-operating-systems "Microsoft Edge Supported Operating Systems"
-[4]: https://v2.tauri.app/start/prerequisites/ "Tauri Prerequisites"
-[5]: https://datatracker.ietf.org/doc/html/rfc8446 "RFC 8446 - The Transport Layer Security Protocol Version 1.3"
-[6]: https://datatracker.ietf.org/doc/html/rfc9000 "RFC 9000 - QUIC: A UDP-Based Multiplexed and Secure Transport"
+[2]: https://datatracker.ietf.org/doc/html/rfc8446 "RFC 8446 - The Transport Layer Security Protocol Version 1.3"
+[3]: https://datatracker.ietf.org/doc/html/rfc9000 "RFC 9000 - QUIC: A UDP-Based Multiplexed and Secure Transport"
+[4]: https://datatracker.ietf.org/doc/html/rfc6330 "RFC 6330 - RaptorQ Forward Error Correction Scheme for Object Delivery"
+[5]: https://docs.ipfs.tech/concepts/merkle-dag/ "IPFS Docs - Merkle Directed Acyclic Graphs"
+[6]: https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-00.html "BBR Congestion Control"
+[7]: https://v2.tauri.app/reference/webview-versions/ "Tauri Webview Versions"
+[8]: https://learn.microsoft.com/en-us/deployedge/microsoft-edge-supported-operating-systems "Microsoft Edge Supported Operating Systems"
+[9]: https://v2.tauri.app/start/prerequisites/ "Tauri Prerequisites"
+[10]: https://support.torproject.org/about-tor/security/ "Tor Project - Security"
