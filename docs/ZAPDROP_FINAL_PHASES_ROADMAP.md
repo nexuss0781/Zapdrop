@@ -157,7 +157,9 @@ Encrypted forwarding, relay storage, branch assignment on the wire, parent failo
 
 **Objective:** Add repair coding and congestion-control adaptation only where measurements justify them.
 
-Implement systematic source blocks, bounded RaptorQ repair-symbol generation, receiver reconstruction, repair-overhead accounting, adaptive chunk profiles, backpressure, and transport-specific congestion-control experiments. Benchmark default TCP behavior, BBR where available, and a future QUIC prototype independently. Keep the reliable direct path as the reference implementation.
+**Implementation status:** A bounded dependency-free GF(256) linear repair foundation and conservative adaptive controller are implemented in `repair.rs`. The foundation supports systematic symbols, deterministic repair symbols, bounded reconstruction, repair-overhead decisions, and loss/RTT/CPU-aware piece-profile selection. It is intentionally not presented as RaptorQ and is not yet enabled on the wire. See `docs/ZAPDROP_PHASE10_STATUS.md`.
+
+Remaining work is vetted RaptorQ-library evaluation, encrypted repair-symbol framing, loss-injection benchmarks, backpressure integration, and independent TCP/BBR/QUIC experiments. Keep the reliable direct path as the reference implementation.
 
 **Acceptance gate:** Repair coding lowers completion time or source amplification on selected loss/mesh workloads without unacceptable CPU or memory cost; ordinary clean-LAN transfers do not regress; and the chosen congestion strategy is documented per platform.
 

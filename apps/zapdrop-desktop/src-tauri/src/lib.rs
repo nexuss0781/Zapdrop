@@ -5,6 +5,7 @@ mod identity;
 pub mod mesh;
 mod network;
 mod pairing;
+pub mod repair;
 pub mod secure;
 mod settings;
 pub mod snapshot;
