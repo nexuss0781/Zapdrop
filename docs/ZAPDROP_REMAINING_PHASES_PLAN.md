@@ -106,29 +106,45 @@ Verify that stale temporary files cannot replace the last committed journal and 
 
 **Exit evidence:** Crash-artifact and malformed-journal tests pass in default and `swarm-v2` builds, the sparse-resume loopback remains green, and the full qualification harness passes. See `docs/ZAPDROP_PHASE10_STALE_STATE_RECOVERY.md`.
 
-### Phase 12 — Process-termination and remaining snapshot integration acceptance
+### Phase 12 — Journal-worker process-termination acceptance
 
-Qualify recovery after an actual receiver-process termination, multi-page metadata transport, subtree reuse across independent network snapshots, and explicit source-mutation revisions. Keep the 4 GiB-plus physical-file requirement as a separately recorded hardware gate.
+**State:** Complete in this revision; active receiver termination during payload writes remains open.
 
-### Phase 13 — Phase 9 direct-only topology integration
+The qualification suite self-spawns and terminates a journal worker after a committed journal and an in-flight truncated temporary artifact exist, then verifies the committed record survives.
+
+**Exit evidence:** Default and `swarm-v2` process-termination tests pass, and the full qualification harness includes them. See `docs/ZAPDROP_PHASE12_PROCESS_TERMINATION.md`.
+
+### Phase 13 — Bounded multi-page metadata-chain transport
+
+**State:** Complete in this revision; active-transfer interruption and broader snapshot integration remain open.
+
+The experimental v2 direct path transports a bounded encrypted chain of metadata pages before approval, validates content-derived page IDs and links, and matches the complete object set against the signed manifest.
+
+**Exit evidence:** A deterministic 600-item chain test, existing direct transfer, sparse resume, and the full qualification harness pass. See `docs/ZAPDROP_PHASE13_METADATA_CHAIN.md`.
+
+### Phase 14 — Active-transfer interruption and remaining snapshot integration
+
+Qualify interruption during active payload writes, subtree reuse across independent network snapshots, directory and piece-index object retrieval, explicit source-mutation revisions, and the 4 GiB-plus physical-file requirement as a separately recorded hardware gate.
+
+### Phase 15 — Phase 9 direct-only topology integration
 
 Only after the direct path and authorization gates are stable, implement the least-privilege tree/mesh data plane behind an explicit feature flag. Enforce signed job scope, relay consent, object allow-lists, byte budgets, expiry, revocation, and direct fallback. Do not enable arbitrary forwarding.
 
 **Exit evidence:** Multi-process tests demonstrate that unauthorized relays cannot receive or forward unrelated content, and direct fallback remains functional.
 
-### Phase 14 — Phase 10 repair integration
+### Phase 16 — Phase 10 repair integration
 
 Evaluate repair coding against measured loss conditions, then integrate only a bounded encrypted repair path if it improves completion time or source amplification without unacceptable CPU/memory cost. Keep systematic direct transfer as the reference path.
 
 **Exit evidence:** Loss-injection benchmark, resource measurements, protocol tests, and an explicit decision to enable or defer repair.
 
-### Phase 15 — Phase 11 companion runtime boundary
+### Phase 17 — Phase 11 companion runtime boundary
 
 Implement the companion’s authenticated pairing, receive approval, send/receive operations, snapshot/piece/journal compatibility, and version negotiation only for platforms that can be built and tested honestly. If legacy Windows runtime support cannot be qualified, publish a clear supported-platform boundary instead of claiming compatibility.
 
 **Exit evidence:** Modern desktop and companion exchange content in a reproducible test, or the unsupported-platform boundary is documented and enforced.
 
-### Phase 16 — Final Windows release and physical qualification
+### Phase 18 — Final Windows release and physical qualification
 
 Run the full automated gate, build Windows artifacts, perform the physical-LAN matrix, record privacy and firewall behavior, publish compatibility and known limitations, and package only artifacts whose signing and runtime status are explicit.
 
@@ -136,4 +152,4 @@ Run the full automated gate, build Windows artifacts, perform the physical-LAN m
 
 ## Immediate next move
 
-Phase 11 is complete in this revision. The next implementation action is **Phase 12 only**: qualify actual process termination and remaining snapshot integration. No tree/mesh, repair, companion, or release work will be started in the same phase. Phase 12 must be tested, documented, committed, and pushed before the next phase begins.
+Phase 13 is complete in this revision. The next implementation action is **Phase 14 only**: qualify active-transfer interruption and remaining snapshot integration. No tree/mesh, repair, companion, or release work will be started in the same phase. Phase 14 must be tested, documented, committed, and pushed before the next phase begins.

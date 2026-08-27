@@ -34,6 +34,7 @@ for test_name in \
   persists_sparse_resume_ranges_for_large_file_fixture \
   metadata_page_roundtrip_rejects_invalid_exchange_data \
   secure_v2_partial_state_mismatch_resets_stale_journal \
+  secure_v2_metadata_chain_is_bounded_and_manifest_bound \
   secure_v2_direct_file_transfer_resumes_from_persisted_sparse_journal; do
   run_test "swarm-v2" "$test_name"
 done

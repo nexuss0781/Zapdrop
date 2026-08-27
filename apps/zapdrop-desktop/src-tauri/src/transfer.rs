@@ -74,6 +74,10 @@ const MAX_V2_DIRECT_ITEMS: usize = 100_000;
 const MAX_V2_DIRECT_TOTAL_BYTES: u64 = 1 << 50;
 #[cfg(feature = "swarm-v2")]
 const MAX_V2_FRAME_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(feature = "swarm-v2")]
+const V2_METADATA_PAGE_BYTES: usize = 16 * 1024;
+#[cfg(feature = "swarm-v2")]
+const MAX_V2_METADATA_PAGES: usize = 2048;
 
 #[cfg(feature = "swarm-v2")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1189,18 +1193,26 @@ pub fn handle_secure_incoming(
         Ok(clone) => BufReader::new(clone),
         Err(_) => return,
     };
-    let metadata_frame: EncryptedFrame = match read_v2_frame(&mut reader) {
-        Ok(value) => value,
-        Err(_) => return,
-    };
-    let metadata: V2DirectMetadataPage =
-        match open_v2_json(&mut channel, &metadata_frame, V2_METADATA_AAD) {
+    let mut metadata_pages = Vec::new();
+    loop {
+        let metadata_frame: EncryptedFrame = match read_v2_frame(&mut reader) {
             Ok(value) => value,
-            Err(error) => {
-                let _ = write_error(&stream, &error.to_string());
-                return;
-            }
+            Err(_) => return,
         };
+        let metadata: V2DirectMetadataPage =
+            match open_v2_json(&mut channel, &metadata_frame, V2_METADATA_AAD) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = write_error(&stream, &error.to_string());
+                    return;
+                }
+            };
+        let terminal = metadata.page.next_page.is_none();
+        metadata_pages.push(metadata);
+        if terminal || metadata_pages.len() >= MAX_V2_METADATA_PAGES {
+            break;
+        }
+    }
     let frame: EncryptedFrame = match read_v2_frame(&mut reader) {
         Ok(value) => value,
         Err(_) => return,
@@ -1216,7 +1228,7 @@ pub fn handle_secure_incoming(
         let _ = write_error(&stream, &error.to_string());
         return;
     }
-    if let Err(error) = validate_v2_metadata_page(&metadata, &offer.job, &offer.items) {
+    if let Err(error) = validate_v2_metadata_pages(&metadata_pages, &offer.job, &offer.items) {
         let _ = write_error(&stream, &error.to_string());
         return;
     }
@@ -1427,62 +1439,137 @@ fn create_v2_job(
 }
 
 #[cfg(feature = "swarm-v2")]
-fn build_v2_metadata_page(
+fn metadata_page_wire_size(
     transfer_id: &str,
-    items: &[ManifestItem],
-) -> io::Result<V2DirectMetadataPage> {
-    let mut page = crate::snapshot::SnapshotMetadataPage {
-        kind: "zapdrop_snapshot_metadata_page".to_string(),
-        version: SWARM_PROTOCOL_VERSION,
-        page_id: "pending".to_string(),
-        objects: items
-            .iter()
-            .map(|item| crate::snapshot::SnapshotObjectRef {
-                kind: "file".to_string(),
-                object_id: item.sha256.clone(),
-                byte_len: item.size,
-            })
-            .collect(),
-        next_page: None,
-    };
-    page.page_id = digest_bytes(&serde_json::to_vec(&page).map_err(invalid)?);
-    page.validate()?;
-    Ok(V2DirectMetadataPage {
+    objects: &[crate::snapshot::SnapshotObjectRef],
+) -> io::Result<usize> {
+    serde_json::to_vec(&V2DirectMetadataPage {
         kind: V2_DIRECT_METADATA_KIND.to_string(),
         version: SWARM_PROTOCOL_VERSION,
         job_id: transfer_id.to_string(),
-        page,
+        page: crate::snapshot::SnapshotMetadataPage {
+            kind: "zapdrop_snapshot_metadata_page".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            page_id: "0".repeat(64),
+            objects: objects.to_vec(),
+            next_page: Some("0".repeat(64)),
+        },
     })
+    .map(|bytes| bytes.len())
+    .map_err(invalid)
 }
 
 #[cfg(feature = "swarm-v2")]
-fn validate_v2_metadata_page(
-    metadata: &V2DirectMetadataPage,
+fn build_v2_metadata_pages(
+    transfer_id: &str,
+    items: &[ManifestItem],
+) -> io::Result<Vec<V2DirectMetadataPage>> {
+    let objects = items
+        .iter()
+        .map(|item| crate::snapshot::SnapshotObjectRef {
+            kind: "file".to_string(),
+            object_id: item.sha256.clone(),
+            byte_len: item.size,
+        })
+        .collect::<Vec<_>>();
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    for object in objects {
+        let mut candidate = current.clone();
+        candidate.push(object.clone());
+        if !current.is_empty()
+            && metadata_page_wire_size(transfer_id, &candidate)? > V2_METADATA_PAGE_BYTES
+        {
+            groups.push(current);
+            current = vec![object];
+        } else if current.is_empty()
+            && metadata_page_wire_size(transfer_id, &candidate)? > V2_METADATA_PAGE_BYTES
+        {
+            return Err(invalid("v2 metadata object cannot fit in a page"));
+        } else {
+            current = candidate;
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    if groups.is_empty() {
+        return Err(invalid("v2 metadata page has no objects"));
+    }
+    if groups.len() > MAX_V2_METADATA_PAGES {
+        return Err(invalid("v2 metadata page chain is too long"));
+    }
+    let mut pages = Vec::with_capacity(groups.len());
+    let mut next = None;
+    for objects in groups.into_iter().rev() {
+        let mut page = crate::snapshot::SnapshotMetadataPage {
+            kind: "zapdrop_snapshot_metadata_page".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            page_id: "pending".to_string(),
+            objects,
+            next_page: next.clone(),
+        };
+        page.page_id = digest_bytes(&serde_json::to_vec(&page).map_err(invalid)?);
+        page.validate()?;
+        pages.push(V2DirectMetadataPage {
+            kind: V2_DIRECT_METADATA_KIND.to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            job_id: transfer_id.to_string(),
+            page,
+        });
+        next = Some(pages.last().unwrap().page.page_id.clone());
+    }
+    pages.reverse();
+    Ok(pages)
+}
+
+#[cfg(feature = "swarm-v2")]
+fn validate_v2_metadata_pages(
+    metadata: &[V2DirectMetadataPage],
     job: &SwarmJob,
     items: &[ManifestItem],
 ) -> io::Result<()> {
-    if metadata.kind != V2_DIRECT_METADATA_KIND
-        || metadata.version != SWARM_PROTOCOL_VERSION
-        || metadata.job_id != job.job_id
-    {
-        return Err(invalid("invalid v2 metadata page envelope"));
+    if metadata.is_empty() || metadata.len() > MAX_V2_METADATA_PAGES {
+        return Err(invalid("invalid v2 metadata page chain length"));
     }
-    metadata.page.validate()?;
+    let mut actual = Vec::new();
+    for (index, page) in metadata.iter().enumerate() {
+        if page.kind != V2_DIRECT_METADATA_KIND
+            || page.version != SWARM_PROTOCOL_VERSION
+            || page.job_id != job.job_id
+        {
+            return Err(invalid("invalid v2 metadata page envelope"));
+        }
+        page.page.validate()?;
+        let mut canonical_page = page.page.clone();
+        canonical_page.page_id = "pending".to_string();
+        let expected_page_id = digest_bytes(&serde_json::to_vec(&canonical_page).map_err(invalid)?);
+        if page.page.page_id != expected_page_id {
+            return Err(invalid("v2 metadata page ID does not match content"));
+        }
+        if index + 1 < metadata.len() {
+            if page.page.next_page.as_deref() != Some(metadata[index + 1].page.page_id.as_str()) {
+                return Err(invalid("v2 metadata page chain link mismatch"));
+            }
+        } else if page.page.next_page.is_some() {
+            return Err(invalid("v2 metadata page chain is not terminated"));
+        }
+        actual.extend(
+            page.page
+                .objects
+                .iter()
+                .filter(|object| object.kind == "file")
+                .map(|object| (object.object_id.clone(), object.byte_len)),
+        );
+    }
     let mut expected = items
         .iter()
         .map(|item| (item.sha256.clone(), item.size))
         .collect::<Vec<_>>();
-    let mut actual = metadata
-        .page
-        .objects
-        .iter()
-        .filter(|object| object.kind == "file")
-        .map(|object| (object.object_id.clone(), object.byte_len))
-        .collect::<Vec<_>>();
     expected.sort_unstable();
     actual.sort_unstable();
     if actual != expected {
-        return Err(invalid("v2 metadata page does not match manifest"));
+        return Err(invalid("v2 metadata pages do not match manifest"));
     }
     Ok(())
 }
@@ -1565,11 +1652,13 @@ fn send_v2_direct(
         conflict_policy: policy.to_string(),
         key_envelope: None,
     };
-    let metadata = build_v2_metadata_page(&job.job_id, &manifest)?;
-    write_v2_frame(
-        &stream,
-        &seal_v2_json(&mut channel, &metadata, V2_METADATA_AAD)?,
-    )?;
+    let metadata_pages = build_v2_metadata_pages(&job.job_id, &manifest)?;
+    for metadata in &metadata_pages {
+        write_v2_frame(
+            &stream,
+            &seal_v2_json(&mut channel, metadata, V2_METADATA_AAD)?,
+        )?;
+    }
     write_v2_frame(&stream, &seal_v2_json(&mut channel, &offer, V2_JOB_AAD)?)?;
     let decision_frame: EncryptedFrame = read_v2_frame(&mut reader)?;
     let decision: V2DirectDecision = open_v2_json(&mut channel, &decision_frame, V2_JOB_AAD)?;
@@ -3933,6 +4022,51 @@ mod tests {
         );
         let loaded = crate::snapshot::TransferJournal::load(&journal_file).unwrap();
         assert!(loaded.items.iter().any(|entry| entry.complete));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "swarm-v2")]
+    #[test]
+    fn secure_v2_metadata_chain_is_bounded_and_manifest_bound() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-metadata-chain-{}", uuid::Uuid::new_v4()));
+        let store = SettingsStore::new(root.clone());
+        let identity = DeviceIdentity::load_or_create(&store).unwrap();
+        let signing_key = identity.signing_key(&store).unwrap();
+        let items = (0..600)
+            .map(|index| ManifestItem {
+                item_id: format!("item-{index}"),
+                relative_path: format!("fixture/file-{index}.bin"),
+                kind: "file".to_string(),
+                size: index as u64 + 1,
+                sha256: format!("{:064x}", index + 1),
+            })
+            .collect::<Vec<_>>();
+        let (job, _) = create_v2_job(
+            &identity,
+            "metadata-chain",
+            "recipient",
+            &items,
+            &signing_key,
+        )
+        .unwrap();
+        let pages = build_v2_metadata_pages(&job.job_id, &items).unwrap();
+        assert!(pages.len() > 1);
+        assert!(pages.len() <= MAX_V2_METADATA_PAGES);
+        assert!(pages.iter().all(|page| {
+            serde_json::to_vec(page).unwrap().len() <= V2_METADATA_PAGE_BYTES + 1024
+        }));
+        for pair in pages.windows(2) {
+            assert_eq!(
+                pair[0].page.next_page.as_deref(),
+                Some(pair[1].page.page_id.as_str())
+            );
+        }
+        assert!(pages.last().unwrap().page.next_page.is_none());
+        validate_v2_metadata_pages(&pages, &job, &items).unwrap();
+        let mut tampered = pages.clone();
+        tampered[0].page.next_page = Some("f".repeat(64));
+        assert!(validate_v2_metadata_pages(&tampered, &job, &items).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
