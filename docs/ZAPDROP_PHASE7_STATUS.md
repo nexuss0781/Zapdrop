@@ -12,4 +12,10 @@ Metadata objects can be emitted as bounded chained pages, and exact directory mo
 
 The implementation includes tests for canonical snapshots, Unicode normalization, traversal rejection, bounded piece and metadata pages, exact subtree-generation matching, source mutation detection, disk-space preflight, sparse missing-range recovery, and atomic journal round trips. Remaining Phase 7 qualification work is a network control exchange for metadata pages and subtree reuse across independent jobs, disk-full fault injection, durable sparse writes across process termination, and 4 GiB-plus physical-file testing. Those capabilities are deliberately not claimed as fully qualified by this status document.
 
+## Network metadata contract slice
+
+The metadata-page type now exposes bounded validation for protocol kind, version, 64-character digest identifiers, allowed object kinds, and chained page links. Serialization round-trip tests reject malformed page IDs, object IDs, object kinds, and next-page links. The snapshot qualification runner exercises these checks in both default and `swarm-v2` builds.
+
+This is a validation and qualification contract only. Paged metadata is not yet exchanged on the network, and the v1 path remains the default. Network page transport, interruption after process termination, and 4 GiB-plus physical-file acceptance remain open follow-up work.
+
 The v1 path remains the default and is not switched to the Phase 7 engine. v2 remains feature-gated and opt-in pending the Phase 6 security and physical-LAN gates.

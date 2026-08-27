@@ -130,6 +130,33 @@ pub struct SnapshotMetadataPage {
     pub next_page: Option<String>,
 }
 
+impl SnapshotMetadataPage {
+    pub fn validate(&self) -> io::Result<()> {
+        if self.kind != "zapdrop_snapshot_metadata_page"
+            || self.version != SWARM_PROTOCOL_VERSION
+            || !is_digest_id(&self.page_id)
+            || self.objects.len() > 100_000
+        {
+            return Err(invalid("invalid snapshot metadata page"));
+        }
+        if self
+            .next_page
+            .as_deref()
+            .is_some_and(|page| !is_digest_id(page))
+        {
+            return Err(invalid("invalid snapshot metadata page link"));
+        }
+        for object in &self.objects {
+            if !matches!(object.kind.as_str(), "directory" | "file" | "piece-index")
+                || !is_digest_id(&object.object_id)
+            {
+                return Err(invalid("invalid snapshot metadata object"));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SubtreeCacheEntry {
@@ -234,6 +261,7 @@ pub fn build_metadata_pages(
             next_page: next.clone(),
         };
         page.page_id = digest_json(&page)?;
+        page.validate()?;
         next = Some(page.page_id.clone());
         pages.push(page);
     }
@@ -805,6 +833,10 @@ pub fn journal_path(root: &Path, job_id: &str) -> PathBuf {
         .join(format!("job-{}.json", digest_bytes(job_id.as_bytes())))
 }
 
+fn is_digest_id(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn metadata_page_base_size(has_next: bool) -> usize {
     serde_json::to_vec(&SnapshotMetadataPage {
         kind: "zapdrop_snapshot_metadata_page".to_string(),
@@ -973,6 +1005,37 @@ mod tests {
             subtree.object_id
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metadata_page_roundtrip_rejects_invalid_exchange_data() {
+        let mut page = SnapshotMetadataPage {
+            kind: "zapdrop_snapshot_metadata_page".to_string(),
+            version: SWARM_PROTOCOL_VERSION,
+            page_id: "a".repeat(64),
+            objects: vec![SnapshotObjectRef {
+                kind: "file".to_string(),
+                object_id: "b".repeat(64),
+                byte_len: 12,
+            }],
+            next_page: Some("c".repeat(64)),
+        };
+        page.validate().unwrap();
+        let encoded = serde_json::to_vec(&page).unwrap();
+        let decoded: SnapshotMetadataPage = serde_json::from_slice(&encoded).unwrap();
+        decoded.validate().unwrap();
+
+        page.page_id = "not-a-digest".to_string();
+        assert!(page.validate().is_err());
+        page.page_id = "a".repeat(64);
+        page.objects[0].object_id = "bad".to_string();
+        assert!(page.validate().is_err());
+        page.objects[0].object_id = "b".repeat(64);
+        page.objects[0].kind = "unknown".to_string();
+        assert!(page.validate().is_err());
+        page.objects[0].kind = "file".to_string();
+        page.next_page = Some("bad-link".to_string());
+        assert!(page.validate().is_err());
     }
 
     #[test]
