@@ -66,31 +66,37 @@ Add malformed-input/fuzz targets or bounded property tests for discovery, pairin
 
 **Exit evidence:** Reproducible robustness commands and their results are checked in, with unresolved findings listed rather than hidden.
 
-### Phase 7 — Phase 7 large-dataset acceptance
+### Phase 7 — Controlled Phase 7 snapshot qualification
+
+**State:** Complete in this revision; physical and process-termination gates remain open.
 
 Stress snapshot indexing, subtree reuse, sparse resume, source mutation, disk-full behavior, Unicode paths, and large files using controlled local fixtures. Separate memory/CPU measurements from functional pass/fail claims.
 
-**Exit evidence:** Automated large-dataset report and remaining 4 GiB-plus physical-file requirements are documented.
+**Exit evidence:** A 512-file deterministic fixture, bounded serialized metadata pages, unchanged-subtree reuse, and atomic sparse journal persistence pass in default and `swarm-v2` builds. See `docs/ZAPDROP_PHASE6_SNAPSHOT_QUALIFICATION.md`.
 
-### Phase 8 — Phase 9 direct-only topology integration
+### Phase 8 — Network metadata and interruption acceptance
+
+Implement or qualify network paged-metadata exchange, subtree reuse across independent snapshots, durable sparse writes across process termination, and explicit source-mutation revisions. Keep the 4 GiB-plus physical-file requirement as a separately recorded hardware gate.
+
+### Phase 9 — Phase 9 direct-only topology integration
 
 Only after the direct path and authorization gates are stable, implement the least-privilege tree/mesh data plane behind an explicit feature flag. Enforce signed job scope, relay consent, object allow-lists, byte budgets, expiry, revocation, and direct fallback. Do not enable arbitrary forwarding.
 
 **Exit evidence:** Multi-process tests demonstrate that unauthorized relays cannot receive or forward unrelated content, and direct fallback remains functional.
 
-### Phase 9 — Phase 10 repair integration
+### Phase 10 — Phase 10 repair integration
 
 Evaluate repair coding against measured loss conditions, then integrate only a bounded encrypted repair path if it improves completion time or source amplification without unacceptable CPU/memory cost. Keep systematic direct transfer as the reference path.
 
 **Exit evidence:** Loss-injection benchmark, resource measurements, protocol tests, and an explicit decision to enable or defer repair.
 
-### Phase 10 — Phase 11 companion runtime boundary
+### Phase 11 — Phase 11 companion runtime boundary
 
 Implement the companion’s authenticated pairing, receive approval, send/receive operations, snapshot/piece/journal compatibility, and version negotiation only for platforms that can be built and tested honestly. If legacy Windows runtime support cannot be qualified, publish a clear supported-platform boundary instead of claiming compatibility.
 
 **Exit evidence:** Modern desktop and companion exchange content in a reproducible test, or the unsupported-platform boundary is documented and enforced.
 
-### Phase 11 — Final Windows release and physical qualification
+### Phase 12 — Final Windows release and physical qualification
 
 Run the full automated gate, build Windows artifacts, perform the physical-LAN matrix, record privacy and firewall behavior, publish compatibility and known limitations, and package only artifacts whose signing and runtime status are explicit.
 
@@ -98,4 +104,4 @@ Run the full automated gate, build Windows artifacts, perform the physical-LAN m
 
 ## Immediate next move
 
-Phase 4 is complete in this revision. The next implementation action is **Phase 5 only**: implement explicit v2 re-handshake/rekey orchestration. No protocol fuzzing, tree/mesh, repair, companion, or release work will be started in the same phase. Phase 5 must be tested, documented, committed, and pushed before Phase 6 begins.
+Phase 7 is complete in this revision. The next implementation action is **Phase 8 only**: qualify network metadata and interruption behavior. No tree/mesh, repair, companion, or release work will be started in the same phase. Phase 8 must be tested, documented, committed, and pushed before the next phase begins.

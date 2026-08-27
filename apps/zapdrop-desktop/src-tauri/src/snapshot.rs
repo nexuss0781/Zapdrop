@@ -205,20 +205,20 @@ pub fn build_metadata_pages(
     }));
     let mut groups = Vec::new();
     let mut current = Vec::new();
-    let mut current_bytes = 2usize;
+    let mut current_bytes = metadata_page_base_size(true);
     for object in objects {
         let object_bytes = serde_json::to_vec(&object).map_err(invalid)?.len();
-        if object_bytes + 2 > page_bytes {
+        let added = object_bytes + usize::from(!current.is_empty());
+        if current.is_empty() && current_bytes + added > page_bytes {
             return Err(invalid("metadata object cannot fit in a page"));
         }
-        let added = object_bytes + usize::from(!current.is_empty());
         if !current.is_empty() && current_bytes + added > page_bytes {
             groups.push(current);
             current = Vec::new();
-            current_bytes = 2;
+            current_bytes = metadata_page_base_size(true);
         }
         current.push(object);
-        current_bytes += object_bytes + usize::from(current.len() > 1);
+        current_bytes += added;
     }
     if !current.is_empty() {
         groups.push(current);
@@ -805,6 +805,18 @@ pub fn journal_path(root: &Path, job_id: &str) -> PathBuf {
         .join(format!("job-{}.json", digest_bytes(job_id.as_bytes())))
 }
 
+fn metadata_page_base_size(has_next: bool) -> usize {
+    serde_json::to_vec(&SnapshotMetadataPage {
+        kind: "zapdrop_snapshot_metadata_page".to_string(),
+        version: SWARM_PROTOCOL_VERSION,
+        page_id: "0".repeat(64),
+        objects: Vec::new(),
+        next_page: has_next.then(|| "0".repeat(64)),
+    })
+    .map(|bytes| bytes.len())
+    .unwrap_or(usize::MAX)
+}
+
 fn digest_json<T: Serialize>(value: &T) -> io::Result<String> {
     Ok(digest_bytes(&serde_json::to_vec(value).map_err(invalid)?))
 }
@@ -898,6 +910,106 @@ mod tests {
         assert!(cache
             .reusable("folder", entry.modified_at_nanos.saturating_add(1))
             .is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn qualifies_large_fixture_determinism_and_bounded_metadata() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-large-fixture-{}", uuid::Uuid::new_v4()));
+        let fixture = root.join("fixture");
+        fs::create_dir_all(&fixture).unwrap();
+        for directory in 0..16 {
+            fs::create_dir_all(fixture.join(format!("dir-{directory:02}"))).unwrap();
+        }
+        for index in 0..512 {
+            let directory = fixture.join(format!("dir-{:02}", index % 16));
+            let payload = vec![(index % 251) as u8; 4096];
+            fs::write(directory.join(format!("file-{index:04}.bin")), payload).unwrap();
+        }
+        let options = SnapshotOptions {
+            page_bytes: 64 * 1024,
+            ..Default::default()
+        };
+        let first = build_snapshot(
+            &[SnapshotSource {
+                path: fixture.clone(),
+                relative_path: "fixture".to_string(),
+            }],
+            &options,
+        )
+        .unwrap();
+        assert_eq!(first.root.total_files, 512);
+        assert_eq!(first.root.total_bytes, 512 * 4096);
+        assert_eq!(first.files.len(), 512);
+        assert!(first.piece_pages.len() >= 512);
+        let metadata_pages = build_metadata_pages(&first, options.page_bytes).unwrap();
+        assert!(metadata_pages.len() > 1);
+        assert!(metadata_pages
+            .iter()
+            .all(|page| { serde_json::to_vec(page).unwrap().len() <= options.page_bytes }));
+
+        let second = build_snapshot(
+            &[SnapshotSource {
+                path: fixture.clone(),
+                relative_path: "fixture".to_string(),
+            }],
+            &options,
+        )
+        .unwrap();
+        assert_eq!(first.root.root_id, second.root.root_id);
+        assert_eq!(first.files[0].object_id, second.files[0].object_id);
+        let cache = SubtreeReuseIndex::from_snapshot(&first);
+        let subtree = first
+            .subtree_cache
+            .iter()
+            .find(|entry| entry.relative_path == "fixture/dir-00")
+            .unwrap();
+        assert_eq!(
+            cache
+                .reusable(&subtree.relative_path, subtree.modified_at_nanos)
+                .unwrap()
+                .object_id,
+            subtree.object_id
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persists_sparse_resume_ranges_for_large_file_fixture() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-sparse-fixture-{}", uuid::Uuid::new_v4()));
+        let journal_path = root.join("nested/journal.json");
+        let mut journal = TransferJournal::new("large-job".to_string(), "root-1".to_string());
+        for offset in [0, 4 * 1024 * 1024, 8 * 1024 * 1024] {
+            journal
+                .mark_verified(
+                    "large-object",
+                    &"b".repeat(64),
+                    "fixture/large.bin",
+                    ByteRange {
+                        offset,
+                        length: 1024 * 1024,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            journal.contiguous_offset("large-object", 12 * 1024 * 1024),
+            1024 * 1024
+        );
+        assert_eq!(
+            journal.verified_bytes("large-object", 12 * 1024 * 1024),
+            3 * 1024 * 1024
+        );
+        journal.save_atomic(&journal_path).unwrap();
+        let loaded = TransferJournal::load(&journal_path).unwrap();
+        let missing = loaded
+            .missing_ranges("large-object", 12 * 1024 * 1024, 1024 * 1024)
+            .unwrap();
+        assert_eq!(missing.first().unwrap().offset, 1024 * 1024);
+        assert_eq!(missing.last().unwrap().offset, 11 * 1024 * 1024);
+        assert_eq!(loaded.items[0].verified_ranges.len(), 3);
         fs::remove_dir_all(root).unwrap();
     }
 

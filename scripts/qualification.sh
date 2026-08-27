@@ -18,6 +18,7 @@ fi
 
 cargo fmt --manifest-path apps/zapdrop-desktop/src-tauri/Cargo.toml --check
 ./scripts/physical_lan_qualification.sh --self-check
+./scripts/snapshot_qualification.sh
 ./scripts/security_qualification.sh
 cargo test --manifest-path apps/zapdrop-desktop/src-tauri/Cargo.toml --lib local_three_recipient_parent_harness
 cargo test --manifest-path apps/zapdrop-desktop/src-tauri/Cargo.toml --features swarm-v2 --lib local_three_recipient_parent_harness
