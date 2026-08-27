@@ -167,9 +167,11 @@ Remaining work is vetted RaptorQ-library evaluation, encrypted repair-symbol fra
 
 **Objective:** Extend the protocol beyond the modern Tauri GUI without inheriting SMB’s shared-filesystem assumptions.
 
-Maintain the Windows 10 1803+ and Windows 11 Tauri GUI as the primary supported client. Tauri documents WebView2 and native build prerequisites for Windows [7] [9], while Microsoft’s current Edge support matrix identifies Windows 10 SAC 1709 and later selected editions and Windows 11 as supported Edge platforms [8]. For Windows 7/8.1, build a separately tested minimal native companion only if real users require it. The companion should provide the signed listener, pairing, receive approval, and send/receive commands without depending on the modern WebView. It must share the same protocol version, snapshot, piece, capability, and journal contracts.
+Maintain the Windows 10 1803+ and Windows 11 Tauri GUI as the primary supported client. Tauri documents WebView2 and native build prerequisites for Windows [7] [9], while Microsoft’s current Edge support matrix identifies Windows 10 SAC 1709 and later selected editions and Windows 11 as supported Edge platforms [8].
 
-Add Linux x64/ARM64 and macOS Intel/Apple Silicon targets after the protocol is stable. Do not map drives, expose SMB shares, require domain credentials, or silently grant a remote filesystem browser. The differentiator is deliberate, authorized content movement rather than a new shared-folder administration surface.
+**Implementation status:** A separately buildable, WebView-free `apps/zapdrop-companion` crate now provides capability reporting, highest-common-version negotiation, and strict relative-path validation. It is suitable as the build boundary for an older-Windows or minimal client, but it does not yet implement the shared secure transfer runtime and therefore does not claim legacy-Windows compatibility.
+
+For Windows 7/8.1, complete the companion only if real users require it, with the signed listener, pairing, receive approval, and send/receive commands sharing the same protocol version, snapshot, piece, capability, and journal contracts. Add Linux x64/ARM64 and macOS Intel/Apple Silicon targets after the protocol is stable. Do not map drives, expose SMB shares, require domain credentials, or silently grant a remote filesystem browser. The differentiator is deliberate, authorized content movement rather than a new shared-folder administration surface.
 
 **Acceptance gate:** A modern Windows client exchanges content with the companion using encrypted, version-negotiated protocol; installation and runtime prerequisites are reported clearly; upgrades preserve trust and history according to migration policy; and unsupported operating systems receive an honest compatibility message.
 
@@ -177,7 +179,9 @@ Add Linux x64/ARM64 and macOS Intel/Apple Silicon targets after the protocol is 
 
 **Objective:** Prove the grand design on real networks and publish a supportable product.
 
-Use at least two physical PCs, a wired LAN, a home Wi-Fi router, a phone hotspot, a guest or multicast-blocked network, a restrictive firewall, a VPN-enabled machine, and a low-end or older Windows system. Exercise discovery fallback, trust revocation, encrypted one-to-one transfer, simultaneous bidirectional transfer, two/four/eight-recipient fan-out, tree/mesh mode, repair coding, large-file resume, source mutation, disk-full, cancellation, sleep/wake, and malicious or malformed peers.
+**Implementation status:** `scripts/qualification.sh` provides a reproducible automated gate for default/v2 Rust suites, companion tests, frontend build, feature posture, formatting, whitespace, and obvious credential-artifact checks. `docs/ZAPDROP_PHASE12_STATUS.md` defines the manual qualification and privacy matrix.
+
+The manual gate remains open. Use at least two physical PCs, a wired LAN, a home Wi-Fi router, a phone hotspot, a guest or multicast-blocked network, a restrictive firewall, a VPN-enabled machine, and a low-end or older Windows system. Exercise discovery fallback, trust revocation, encrypted one-to-one transfer, simultaneous bidirectional transfer, two/four/eight-recipient fan-out, tree/mesh mode, repair coding, large-file resume, source mutation, disk-full, cancellation, sleep/wake, and malicious or malformed peers.
 
 The release must include signed or explicitly classified unsigned artifacts, installer and portable options where supported, firewall guidance limited to private networks, WebView2/runtime behavior, protocol version, compatibility matrix, performance report, known limitations, rollback instructions, and a security review. Privacy relay should remain experimental until its threat model, relay abuse controls, and metadata claims are independently reviewed.
 
