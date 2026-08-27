@@ -6,6 +6,7 @@ pub mod mesh;
 mod network;
 mod pairing;
 pub mod repair;
+pub mod scheduler;
 pub mod secure;
 mod settings;
 pub mod snapshot;
@@ -416,6 +417,20 @@ fn cancel_transfer(state: tauri::State<'_, AppState>, transfer_id: String) -> Re
 }
 
 #[tauri::command]
+fn cancel_recipient_transfer(
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+    peer_id: String,
+) -> Result<(), String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    runtime.transfer.cancel_recipient(&transfer_id, &peer_id);
+    Ok(())
+}
+
+#[tauri::command]
 fn revoke_trusted_peer(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -485,6 +500,7 @@ pub fn run() {
             reject_pairing,
             start_transfer,
             cancel_transfer,
+            cancel_recipient_transfer,
             revoke_trusted_peer,
             accept_transfer,
             reject_transfer

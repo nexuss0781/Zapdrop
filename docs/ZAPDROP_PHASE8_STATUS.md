@@ -1,9 +1,9 @@
 # Zapdrop Phase 8 Status
 
-**Status:** Direct fan-out accounting foundation implemented; scheduler qualification continues.
+**Status:** Bounded direct fan-out scheduler implemented; physical multi-PC qualification continues.
 
-Phase 8 now models a multi-recipient transfer as one parent send job with bounded child sessions. The existing recipient limit remains eight, each child retains independent progress, cancellation, retry outcome, and history, and child records carry an optional `parentId`. A parent history record aggregates child completion, partial-success, failure, and cancellation states without hiding a failed recipient inside a successful group result.
+Phase 8 now models a multi-recipient transfer as one parent send job with bounded child sessions. The existing recipient limit remains eight, while `SwarmScheduler` provides FIFO admission, a bounded waiting queue, a configurable active-recipient limit, shared token-bucket bandwidth pacing, bounded retry attempts, and queued progress events. The scheduler is passed into the existing per-recipient workers and does not alter the v1 wire format.
 
-The history schema remains backward-compatible through a defaulted optional field. Existing one-to-one and v1 records remain parentless. The parent record uses a reserved `swarm` peer identity and is reconciled only after all expected child sessions have recorded terminal outcomes.
+Each child retains independent progress, cancellation, retry outcome, and history, and child records carry an optional `parentId`. A parent history record and `transfer-parent-progress` event aggregate child completion, partial-success, failure, cancellation, recipient counts, and transferred bytes without hiding a failed recipient inside a successful group result. The frontend exposes parallelism, queue depth, retry count, and bandwidth controls, and displays parent aggregate progress.
 
-The remaining Phase 8 work is a first-class UI parent-job view, global bandwidth and disk/CPU budgets, fairness scheduling beyond independent thread launch, queued recipients above the active-session limit, per-recipient retry/cancel commands, and mixed file/folder multi-PC qualification. Tree and mesh forwarding remain disabled and are not implied by this slice.
+The remaining Phase 8 work is physical qualification with mixed file/folder jobs, failure injection against real recipients, and finer-grained per-recipient controls. Global disk/CPU budgets and cross-job fairness are not yet implemented; the current bandwidth and concurrency limits are per parent job. Tree and mesh forwarding remain disabled and are not implied by this slice.

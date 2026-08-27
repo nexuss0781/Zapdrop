@@ -137,9 +137,9 @@ The remaining Phase 7 work is a network paged-metadata exchange for very large t
 
 **Objective:** Make group transfer the primary product abstraction.
 
-**Implementation status:** The first direct fan-out accounting slice is implemented. A multi-recipient send creates one parent history record and independent child session records. Child records carry an optional `parentId`; the parent is reconciled into `completed`, `partial`, `failed`, or `cancelled` only after all expected child sessions reach terminal state. The existing bounded limit of eight recipients and simultaneous bidirectional direct-transfer behavior remain in force.
+**Implementation status:** A bounded direct fan-out scheduler is implemented. A multi-recipient send creates one parent history record and independent child session records. Child records carry an optional `parentId`; the parent is reconciled into `completed`, `partial`, `failed`, or `cancelled` only after all expected child sessions reach terminal state. The scheduler provides FIFO admission, bounded active and waiting recipients, one shared per-job bandwidth budget, transient-only bounded retries, queued/retrying progress events, parent aggregate progress, and parent or per-recipient cancellation. The existing bounded limit of eight recipients and simultaneous bidirectional direct-transfer behavior remain in force. See `docs/ZAPDROP_PHASE8_STATUS.md`.
 
-The remaining Phase 8 work is a first-class UI parent-job view, global bandwidth and disk/CPU budgets, fairness scheduling beyond independent thread launch, queued recipients above the active-session limit, per-recipient retry/cancel commands, and mixed file/folder multi-PC qualification. See `docs/ZAPDROP_PHASE8_STATUS.md`.
+The remaining Phase 8 work is physical multi-PC qualification with mixed files and folders, failure injection, measured fairness under heterogeneous recipient speeds, and richer per-recipient retry controls. Cross-job global bandwidth/disk/CPU budgets are not implemented; the current limits are per parent job.
 
 **Acceptance gate:** One source can complete a mixed file/folder job to multiple recipients; one failure does not affect successful peers; slow peers do not starve the group; and all child outcomes reconcile correctly into the parent history.
 

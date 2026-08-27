@@ -11,6 +11,7 @@ use crate::{
     history::{HistoryStore, TransferHistoryEntry},
     identity::DeviceIdentity,
     pairing::{read_json_line, write_json_line},
+    scheduler::{SwarmScheduler, SwarmSchedulerOptions},
     settings::SettingsStore,
     trust::TrustedPeerStore,
 };
@@ -232,6 +233,8 @@ pub struct TransferRequest {
     pub peer_ids: Vec<String>,
     pub sources: Vec<TransferSource>,
     pub conflict_policy: Option<String>,
+    #[serde(default)]
+    pub scheduler: Option<SwarmSchedulerOptions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,6 +261,20 @@ pub struct TransferProgress {
     pub items_done: usize,
     pub total_items: usize,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParentTransferProgress {
+    pub transfer_id: String,
+    pub status: String,
+    pub recipients_total: usize,
+    pub recipients_done: usize,
+    pub recipients_completed: usize,
+    pub recipients_failed: usize,
+    pub recipients_cancelled: usize,
+    pub bytes_done: u64,
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -706,11 +723,34 @@ impl TransferManager {
             .insert(transfer_id.to_string());
     }
 
+    pub fn cancel_recipient(&self, transfer_id: &str, peer_id: &str) {
+        self.cancelled
+            .lock()
+            .expect("cancel set poisoned")
+            .insert(format!("{transfer_id}:{peer_id}"));
+    }
+
+    pub fn clear_recipient_cancel(&self, transfer_id: &str, peer_id: &str) {
+        self.cancelled
+            .lock()
+            .expect("cancel set poisoned")
+            .remove(&format!("{transfer_id}:{peer_id}"));
+    }
+
     pub fn is_cancelled(&self, transfer_id: &str) -> bool {
         self.cancelled
             .lock()
             .expect("cancel set poisoned")
             .contains(transfer_id)
+    }
+
+    pub fn is_cancelled_for(&self, transfer_id: &str, peer_id: &str) -> bool {
+        self.is_cancelled(transfer_id)
+            || self
+                .cancelled
+                .lock()
+                .expect("cancel set poisoned")
+                .contains(&format!("{transfer_id}:{peer_id}"))
     }
 
     fn finish(&self, transfer_id: &str) {
@@ -770,6 +810,17 @@ impl TransferManager {
                 ));
             }
         }
+        let scheduler_options =
+            request
+                .scheduler
+                .clone()
+                .unwrap_or_else(|| SwarmSchedulerOptions {
+                    max_parallel_recipients: selected.len(),
+                    queue_limit: selected.len(),
+                    bandwidth_bytes_per_second: 0,
+                    max_retries: 0,
+                });
+        let scheduler = SwarmScheduler::new(scheduler_options)?;
         let manager = self.clone();
         self.active
             .lock()
@@ -811,6 +862,20 @@ impl TransferManager {
             error: None,
         });
         let expected_children = selected.len();
+        let _ = app.emit(
+            "transfer-parent-progress",
+            ParentTransferProgress {
+                transfer_id: transfer_id.clone(),
+                status: "queued".to_string(),
+                recipients_total: expected_children,
+                recipients_done: 0,
+                recipients_completed: 0,
+                recipients_failed: 0,
+                recipients_cancelled: 0,
+                bytes_done: 0,
+                total_bytes,
+            },
+        );
         for peer in selected {
             let started_at = epoch_seconds();
             let source_names = request
@@ -840,6 +905,7 @@ impl TransferManager {
             let transfer_id = transfer_id.clone();
             let manager = manager.clone();
             let expected_children = expected_children;
+            let scheduler = scheduler.clone();
             let _ = history.record(TransferHistoryEntry {
                 id: format!("{}:{}", transfer_id, peer.id),
                 transfer_id: transfer_id.clone(),
@@ -860,18 +926,80 @@ impl TransferManager {
             thread::Builder::new()
                 .name(format!("zapdrop-transfer-{}", peer.id))
                 .spawn(move || {
-                    let result = send_to_peer(
+                    emit_progress(
                         Some(&app),
-                        &identity,
-                        &store,
-                        &device_name,
-                        &peer,
-                        &sources,
-                        &policy,
                         &transfer_id,
+                        &peer.id,
+                        &peer.name,
+                        "send",
+                        "queued",
+                        None,
+                        0,
                         total_bytes,
-                        &manager,
+                        0,
+                        item_count,
+                        None,
                     );
+                    let result = scheduler.acquire(&peer.id).and_then(|_permit| {
+                        let mut result = Err(invalid("transfer did not run"));
+                        for attempt in 0..=scheduler.options().max_retries {
+                            if manager.is_cancelled_for(&transfer_id, &peer.id) {
+                                result = Err(io::Error::new(
+                                    io::ErrorKind::Interrupted,
+                                    "transfer cancelled",
+                                ));
+                                break;
+                            }
+                            result = send_to_peer(
+                                Some(&app),
+                                &identity,
+                                &store,
+                                &device_name,
+                                &peer,
+                                &sources,
+                                &policy,
+                                &transfer_id,
+                                total_bytes,
+                                &manager,
+                                Some(scheduler.as_ref()),
+                            );
+                            if result.is_ok()
+                                || attempt == scheduler.options().max_retries
+                                || manager.is_cancelled_for(&transfer_id, &peer.id)
+                                || !result
+                                    .as_ref()
+                                    .err()
+                                    .is_some_and(is_retryable_transfer_error)
+                            {
+                                break;
+                            }
+                            let reason = result
+                                .as_ref()
+                                .err()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "transient transfer failure".to_string());
+                            emit_progress(
+                                Some(&app),
+                                &transfer_id,
+                                &peer.id,
+                                &peer.name,
+                                "send",
+                                "retrying",
+                                None,
+                                0,
+                                total_bytes,
+                                0,
+                                item_count,
+                                Some(format!(
+                                    "retry {} of {}: {reason}",
+                                    attempt + 1,
+                                    scheduler.options().max_retries
+                                )),
+                            );
+                            thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
+                        }
+                        result
+                    });
                     let progress = match result {
                         Ok(()) => TransferProgress {
                             transfer_id: transfer_id.clone(),
@@ -891,7 +1019,7 @@ impl TransferManager {
                             peer_id: peer.id.clone(),
                             peer_name: peer.name.clone(),
                             direction: "send".to_string(),
-                            status: if manager.is_cancelled(&transfer_id) {
+                            status: if manager.is_cancelled_for(&transfer_id, &peer.id) {
                                 "cancelled"
                             } else {
                                 "failed"
@@ -921,6 +1049,13 @@ impl TransferManager {
                         total_bytes,
                         &policy,
                     );
+                    emit_parent_progress(
+                        Some(&app),
+                        &history,
+                        &transfer_id,
+                        expected_children,
+                        total_bytes,
+                    );
                     let event = if progress.status == "completed" {
                         "transfer-complete"
                     } else if progress.status == "cancelled" {
@@ -929,6 +1064,7 @@ impl TransferManager {
                         "transfer-failed"
                     };
                     let _ = app.emit(event, progress);
+                    manager.clear_recipient_cancel(&transfer_id, &peer.id);
                     manager.finish(&transfer_id);
                 })
                 .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
@@ -1264,6 +1400,7 @@ fn create_v2_job(
 fn send_v2_direct(
     app: Option<&AppHandle>,
     manager: Option<&TransferManager>,
+    scheduler: Option<&SwarmScheduler>,
     identity: &DeviceIdentity,
     store: &SettingsStore,
     device_name: &str,
@@ -1407,7 +1544,7 @@ fn send_v2_direct(
             file.seek(SeekFrom::Start(current))?;
             let mut index = current / job.chunk_profile.piece_size;
             while current < end {
-                if manager.is_some_and(|manager| manager.is_cancelled(transfer_id)) {
+                if manager.is_some_and(|manager| manager.is_cancelled_for(transfer_id, &peer.id)) {
                     return Err(io::Error::new(
                         io::ErrorKind::Interrupted,
                         "v2 transfer cancelled",
@@ -1436,6 +1573,9 @@ fn send_v2_direct(
                     header,
                     ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
                 };
+                if let Some(scheduler) = scheduler {
+                    scheduler.throttle(read);
+                }
                 write_v2_frame(&stream, &seal_v2_json(&mut channel, &piece, V2_PIECE_AAD)?)?;
                 current += read as u64;
                 index += 1;
@@ -2005,12 +2145,14 @@ fn send_to_peer(
     transfer_id: &str,
     total_bytes: u64,
     manager: &TransferManager,
+    scheduler: Option<&SwarmScheduler>,
 ) -> io::Result<()> {
     #[cfg(feature = "swarm-v2")]
     if v2_switch_enabled("ZAPDROP_SWARM_V2_DIRECT") {
         return send_v2_direct(
             app,
             Some(manager),
+            scheduler,
             identity,
             store,
             device_name,
@@ -2071,7 +2213,7 @@ fn send_to_peer(
         let mut current = offset;
         let mut buffer = vec![0u8; CHUNK_SIZE];
         while current < item.size {
-            if manager.is_cancelled(transfer_id) {
+            if manager.is_cancelled_for(transfer_id, &peer.id) {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "transfer cancelled",
@@ -2080,6 +2222,9 @@ fn send_to_peer(
             let read = file.read(&mut buffer)?;
             if read == 0 {
                 return Err(invalid("source ended before manifest size"));
+            }
+            if let Some(scheduler) = scheduler {
+                scheduler.throttle(read);
             }
             let chunk = TransferChunk {
                 kind: CHUNK_KIND.to_string(),
@@ -2744,6 +2889,21 @@ fn fingerprint(public_key: &[u8; 32]) -> String {
         .collect::<Vec<_>>()
         .join(":")
 }
+fn is_retryable_transfer_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
 fn emit_progress(
     app: Option<&AppHandle>,
     transfer_id: &str,
@@ -2778,6 +2938,58 @@ fn emit_progress(
         },
     );
 }
+fn emit_parent_progress(
+    app: Option<&AppHandle>,
+    history: &HistoryStore,
+    transfer_id: &str,
+    expected_children: usize,
+    total_bytes: u64,
+) {
+    let children = history
+        .list()
+        .into_iter()
+        .filter(|entry| entry.parent_id.as_deref() == Some(transfer_id))
+        .collect::<Vec<_>>();
+    let completed = children
+        .iter()
+        .filter(|entry| entry.status == "completed")
+        .count();
+    let failed = children
+        .iter()
+        .filter(|entry| entry.status == "failed")
+        .count();
+    let cancelled = children
+        .iter()
+        .filter(|entry| entry.status == "cancelled")
+        .count();
+    let done = completed + failed + cancelled;
+    let status = if done < expected_children {
+        "transferring"
+    } else if completed == expected_children {
+        "completed"
+    } else if completed > 0 {
+        "partial"
+    } else if cancelled == expected_children {
+        "cancelled"
+    } else {
+        "failed"
+    };
+    let payload = ParentTransferProgress {
+        transfer_id: transfer_id.to_string(),
+        status: status.to_string(),
+        recipients_total: expected_children,
+        recipients_done: done,
+        recipients_completed: completed,
+        recipients_failed: failed,
+        recipients_cancelled: cancelled,
+        bytes_done: children.iter().map(|entry| entry.bytes_done).sum(),
+        total_bytes,
+    };
+    if let Some(app) = app {
+        let _ = app.emit("transfer-parent-progress", payload);
+    }
+}
+
 fn reconcile_parent_history(
     history: &HistoryStore,
     parent_id: &str,
@@ -2968,6 +3180,26 @@ mod tests {
         thread,
     };
     #[test]
+    fn retries_only_transient_network_errors() {
+        assert!(is_retryable_transfer_error(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out",
+        )));
+        assert!(is_retryable_transfer_error(&io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "reset",
+        )));
+        assert!(!is_retryable_transfer_error(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "denied",
+        )));
+        assert!(!is_retryable_transfer_error(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid",
+        )));
+    }
+
+    #[test]
     fn rejects_traversal() {
         assert!(validate_relative_path("../escape.txt").is_err());
         assert!(validate_relative_path("/absolute.txt").is_err());
@@ -3113,6 +3345,7 @@ mod tests {
                 "transfer-a-to-b",
                 18,
                 &manager_a,
+                None,
             )
         });
         let barrier_b = Arc::clone(&barrier);
@@ -3132,6 +3365,7 @@ mod tests {
                 "transfer-b-to-a",
                 18,
                 &manager_b,
+                None,
             )
         });
         sender_a.join().unwrap().unwrap();
@@ -3229,6 +3463,7 @@ mod tests {
             let source = source.clone();
             move || {
                 send_v2_direct(
+                    None,
                     None,
                     None,
                     &client_identity,
