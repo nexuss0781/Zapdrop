@@ -784,10 +784,13 @@ impl TransferJournal {
             return Err(invalid("piece size cannot be zero"));
         }
         let Some(item) = self.items.iter().find(|item| item.object_id == object_id) else {
-            return Ok(vec![ByteRange {
-                offset: 0,
-                length: total_bytes,
-            }]);
+            return Ok(split_range(
+                ByteRange {
+                    offset: 0,
+                    length: total_bytes,
+                },
+                piece_size,
+            ));
         };
         let mut ranges = item.verified_ranges.clone();
         ranges.sort_by_key(|range| range.offset);
@@ -1124,6 +1127,33 @@ mod tests {
                 .map(|range| (range.offset, range.length))
                 .collect::<Vec<_>>(),
             vec![(4, 4), (12, 4)]
+        );
+    }
+
+    #[test]
+    fn missing_ranges_split_untracked_large_object() {
+        let journal = TransferJournal::new("job-missing".to_string(), "root-missing".to_string());
+        let piece_size = 4 * 1024 * 1024;
+        let total_bytes = 2 * piece_size + 123;
+        let ranges = journal
+            .missing_ranges("untracked", total_bytes, piece_size)
+            .unwrap();
+        assert_eq!(
+            ranges,
+            vec![
+                ByteRange {
+                    offset: 0,
+                    length: piece_size,
+                },
+                ByteRange {
+                    offset: piece_size,
+                    length: piece_size,
+                },
+                ByteRange {
+                    offset: 2 * piece_size,
+                    length: 123,
+                },
+            ]
         );
     }
 

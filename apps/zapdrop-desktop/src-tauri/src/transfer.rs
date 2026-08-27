@@ -4027,6 +4027,125 @@ mod tests {
 
     #[cfg(feature = "swarm-v2")]
     #[test]
+    fn secure_v2_active_transfer_cancellation_stops_payload_loop() {
+        let root =
+            std::env::temp_dir().join(format!("zapdrop-active-cancel-{}", uuid::Uuid::new_v4()));
+        let server_store = SettingsStore::new(root.join("server-data"));
+        let client_store = SettingsStore::new(root.join("client-data"));
+        let source = root.join("active-source.bin");
+        let received = root.join("received");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&received).unwrap();
+        let source_bytes = vec![0x37u8; (3 * crate::swarm::DEFAULT_PIECE_SIZE + 123) as usize];
+        fs::write(&source, &source_bytes).unwrap();
+        let server_identity = DeviceIdentity::load_or_create(&server_store).unwrap();
+        let client_identity = DeviceIdentity::load_or_create(&client_store).unwrap();
+        let server_trust = TrustedPeerStore::load(&server_store).unwrap();
+        server_trust
+            .upsert(TrustedPeer {
+                version: 1,
+                peer_id: client_identity.device_id.clone(),
+                name: "Cancel Client".to_string(),
+                public_key: client_identity.public_key.clone(),
+                fingerprint: client_identity.fingerprint.clone(),
+                first_seen: 1,
+                last_seen: 1,
+                endpoint: "127.0.0.1:0".to_string(),
+            })
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let context = test_context(
+            server_identity.clone(),
+            server_store,
+            server_trust,
+            received.clone(),
+            "Cancel Server",
+        );
+        let server = thread::spawn(move || {
+            let (stream, address) = listener.accept().unwrap();
+            let first: serde_json::Value = read_json_line(&stream).unwrap();
+            assert!(is_secure_hello(&first));
+            let _ = address;
+            handle_secure_incoming(stream, first, context);
+        });
+        let peer = PeerRecord {
+            id: server_identity.device_id.clone(),
+            name: "Cancel Server".to_string(),
+            platform: "windows".to_string(),
+            fingerprint: Some(server_identity.fingerprint.clone()),
+            public_key: Some(server_identity.public_key.clone()),
+            endpoint: endpoint.to_string(),
+            port: endpoint.port(),
+            status: "trusted".to_string(),
+            discovered_via: "secure-v2-cancel-test".to_string(),
+            last_seen: epoch_seconds(),
+            trusted: true,
+        };
+        let manager = TransferManager::new(HistoryStore::load(&client_store).unwrap());
+        let scheduler = SwarmScheduler::new(SwarmSchedulerOptions {
+            max_parallel_recipients: 1,
+            queue_limit: 0,
+            bandwidth_bytes_per_second: 1_000_000,
+            max_retries: 0,
+        })
+        .unwrap();
+        let sender = thread::spawn({
+            let client_identity = client_identity.clone();
+            let client_store = client_store.clone();
+            let peer = peer.clone();
+            let source = source.clone();
+            let sender_manager = manager.clone();
+            let sender_scheduler = scheduler.clone();
+            move || {
+                send_v2_direct(
+                    None,
+                    Some(&sender_manager),
+                    Some(&sender_scheduler),
+                    &client_identity,
+                    &client_store,
+                    "Cancel Client",
+                    &peer,
+                    &[TransferSource {
+                        path: source.to_string_lossy().to_string(),
+                        relative_path: Some("active-source.bin".to_string()),
+                    }],
+                    "rename",
+                    "secure-v2-active-cancel",
+                )
+            }
+        });
+        thread::sleep(Duration::from_millis(150));
+        manager.cancel_recipient("secure-v2-active-cancel", &peer.id);
+        let sender_error = sender
+            .join()
+            .unwrap()
+            .expect_err("active cancellation unexpectedly completed");
+        assert!(
+            matches!(
+                sender_error.kind(),
+                io::ErrorKind::Interrupted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::NotConnected
+            ),
+            "unexpected active-cancellation error: kind={:?}, error={sender_error}",
+            sender_error.kind()
+        );
+        server.join().unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_ne!(
+            fs::metadata(received.join("active-source.bin"))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            source_bytes.len() as u64
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "swarm-v2")]
+    #[test]
     fn secure_v2_metadata_chain_is_bounded_and_manifest_bound() {
         let root =
             std::env::temp_dir().join(format!("zapdrop-metadata-chain-{}", uuid::Uuid::new_v4()));

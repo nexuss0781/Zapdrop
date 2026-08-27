@@ -122,29 +122,37 @@ The experimental v2 direct path transports a bounded encrypted chain of metadata
 
 **Exit evidence:** A deterministic 600-item chain test, existing direct transfer, sparse resume, and the full qualification harness pass. See `docs/ZAPDROP_PHASE13_METADATA_CHAIN.md`.
 
-### Phase 14 — Active-transfer interruption and remaining snapshot integration
+### Phase 14 — Active-transfer cancellation acceptance
 
-Qualify interruption during active payload writes, subtree reuse across independent network snapshots, directory and piece-index object retrieval, explicit source-mutation revisions, and the 4 GiB-plus physical-file requirement as a separately recorded hardware gate.
+**State:** Complete in this revision; receiver restart during active payload writes and broader snapshot integration remain open.
 
-### Phase 15 — Phase 9 direct-only topology integration
+The experimental v2 sender now has a real throttled loopback cancellation test. A recipient canceled while payload transmission is active exits without completing or publishing the destination file. Untracked large objects also split into valid piece-sized missing ranges.
+
+**Exit evidence:** Active cancellation, large missing-range splitting, metadata-chain, sparse-resume, and full qualification tests pass. See `docs/ZAPDROP_PHASE14_ACTIVE_INTERRUPTION.md`.
+
+### Phase 15 — Cross-snapshot object integration acceptance
+
+Qualify receiver restart during an active payload write, subtree reuse across independent network snapshots, directory and piece-index object retrieval, explicit source-mutation revisions, and the 4 GiB-plus physical-file requirement as a separately recorded hardware gate.
+
+### Phase 16 — Phase 9 direct-only topology integration
 
 Only after the direct path and authorization gates are stable, implement the least-privilege tree/mesh data plane behind an explicit feature flag. Enforce signed job scope, relay consent, object allow-lists, byte budgets, expiry, revocation, and direct fallback. Do not enable arbitrary forwarding.
 
 **Exit evidence:** Multi-process tests demonstrate that unauthorized relays cannot receive or forward unrelated content, and direct fallback remains functional.
 
-### Phase 16 — Phase 10 repair integration
+### Phase 17 — Phase 10 repair integration
 
 Evaluate repair coding against measured loss conditions, then integrate only a bounded encrypted repair path if it improves completion time or source amplification without unacceptable CPU/memory cost. Keep systematic direct transfer as the reference path.
 
 **Exit evidence:** Loss-injection benchmark, resource measurements, protocol tests, and an explicit decision to enable or defer repair.
 
-### Phase 17 — Phase 11 companion runtime boundary
+### Phase 18 — Phase 11 companion runtime boundary
 
 Implement the companion’s authenticated pairing, receive approval, send/receive operations, snapshot/piece/journal compatibility, and version negotiation only for platforms that can be built and tested honestly. If legacy Windows runtime support cannot be qualified, publish a clear supported-platform boundary instead of claiming compatibility.
 
 **Exit evidence:** Modern desktop and companion exchange content in a reproducible test, or the unsupported-platform boundary is documented and enforced.
 
-### Phase 18 — Final Windows release and physical qualification
+### Phase 19 — Final Windows release and physical qualification
 
 Run the full automated gate, build Windows artifacts, perform the physical-LAN matrix, record privacy and firewall behavior, publish compatibility and known limitations, and package only artifacts whose signing and runtime status are explicit.
 
@@ -152,4 +160,4 @@ Run the full automated gate, build Windows artifacts, perform the physical-LAN m
 
 ## Immediate next move
 
-Phase 13 is complete in this revision. The next implementation action is **Phase 14 only**: qualify active-transfer interruption and remaining snapshot integration. No tree/mesh, repair, companion, or release work will be started in the same phase. Phase 14 must be tested, documented, committed, and pushed before the next phase begins.
+Phase 14 is complete in this revision. The next implementation action is **Phase 15 only**: qualify cross-snapshot object integration. No tree/mesh, repair, companion, or release work will be started in the same phase. Phase 15 must be tested, documented, committed, and pushed before the next phase begins.

@@ -35,9 +35,10 @@ for test_name in \
   metadata_page_roundtrip_rejects_invalid_exchange_data \
   secure_v2_partial_state_mismatch_resets_stale_journal \
   secure_v2_metadata_chain_is_bounded_and_manifest_bound \
+  secure_v2_active_transfer_cancellation_stops_payload_loop \
   secure_v2_direct_file_transfer_resumes_from_persisted_sparse_journal; do
   run_test "swarm-v2" "$test_name"
 done
 
-printf '%s\n' 'Snapshot qualification passed: deterministic 512-file indexing, serialized metadata bounds, subtree reuse, sparse journal persistence, metadata-page exchange validation, stale-state reset, crash-artifact rejection, actual process termination, and v2 sparse-resume loopback passed in default and swarm-v2 builds.'
-printf '%s\n' 'This remains a controlled local fixture; it does not claim receiver termination during active payload writes or 4 GiB-plus physical-file acceptance.'
+printf '%s\n' 'Snapshot qualification passed: deterministic 512-file indexing, serialized metadata bounds, subtree reuse, sparse journal persistence, metadata-page exchange validation, stale-state reset, crash-artifact rejection, actual process termination, active-transfer cancellation, and v2 sparse-resume loopback passed in default and swarm-v2 builds.'
+printf '%s\n' 'This remains a controlled local fixture; it does not claim receiver process restart during an active payload write or 4 GiB-plus physical-file acceptance.'

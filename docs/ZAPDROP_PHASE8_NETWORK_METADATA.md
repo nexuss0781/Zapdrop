@@ -22,4 +22,4 @@ This preserves the authorization boundary: discovery does not authorize a peer, 
 
 This is a bounded multi-page exchange, not an unbounded paged-tree protocol. The chain is capped at 2,048 pages and each encrypted metadata payload is bounded to a 16 KiB packing target. Subtree reuse across independent network snapshots, active-transfer interruption behavior, and 4 GiB-plus physical-file acceptance remain open. The `swarm-v2` path remains feature-gated and experimental; no TLS 1.3 or production-certified security claim is made.
 
-The next isolated phase is active-transfer interruption and snapshot integration acceptance. It must be implemented and verified separately from tree/mesh, repair, companion, and release work.
+Active-transfer interruption acceptance is now covered separately. The next isolated phase is remaining snapshot integration, including cross-snapshot subtree reuse and object retrieval. It must be implemented and verified separately from tree/mesh, repair, companion, and release work.
