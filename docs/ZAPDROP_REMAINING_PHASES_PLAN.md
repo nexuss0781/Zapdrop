@@ -176,4 +176,4 @@ Run the full automated gate, build Windows artifacts, perform the physical-LAN m
 
 ## Immediate next move
 
-Phase 17 is complete. The next active boundary is **Phase 18 — repair integration evaluation**, to be implemented, tested, documented, committed, and pushed separately. No companion or release work will begin in Phase 18. Final Windows packaging, physical-LAN qualification, and release artifacts remain reserved for Phase 20.
+Phase 17 is complete. The next active boundary is **Phase 18 — repair integration evaluation**, to be implemented, tested, documented, committed, and pushed separately. No companion or release work will begin in Phase 18. Final Windows packaging, physical-LAN qualification, and release artifacts remain reserved for Phase 20. The complete execution handoff is [`docs/ZAPDROP_NEXT_AGENT_HANDOFF.md`](ZAPDROP_NEXT_AGENT_HANDOFF.md).
